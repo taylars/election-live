@@ -61,11 +61,16 @@ export function marginFill(m: number): string {
 
 export const TOSSUP = '#5b5540';
 
-/** Seat-bar colours for each projection tier: solid when secured, paler as it gets less certain. */
+/** Mixes a colour toward white; amount 0 = unchanged, 1 = white. */
+function lighten(color: string, amount: number): string {
+  return `rgb(${hex(color).map((v) => Math.round(v + (255 - v) * amount)).join(',')})`;
+}
+
+/** Seat-bar colours for each projection tier: solid when secured, lighter as it gets less certain. */
 export const LEVEL_FILL: Record<'secured' | 'likely' | 'lean', (s: Side) => string> = {
   secured: (s) => PARTY[s],
-  likely: (s) => tint(PARTY[s], 0.6),
-  lean: (s) => tint(PARTY[s], 0.35),
+  likely: (s) => lighten(PARTY[s], 0.35),
+  lean: (s) => lighten(PARTY[s], 0.65),
 };
 
 const RATING_STRENGTH: Record<string, number> = { Safe: 0.55, Likely: 0.42, Lean: 0.3, Tilt: 0.2 };
