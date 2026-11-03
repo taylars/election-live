@@ -65,13 +65,16 @@ export interface District {
   state: string; // postal code, upper case
   name: string;
   d: string;
+  bounds: [[number, number], [number, number]];
 }
 
-let districts: Promise<District[]> | undefined;
+const districts = new Map<number, Promise<District[]>>();
 
-/** Loads the 2026 district lines (lon/lat) and projects them to match the us-atlas Albers frame. */
-export function loadDistricts(): Promise<District[]> {
-  districts ??= fetch(`${import.meta.env.BASE_URL}data/districts-2026.json`)
+/** Loads one year's district lines (lon/lat) and projects them to match the us-atlas Albers frame. */
+export function loadDistricts(year: number): Promise<District[]> {
+  let p = districts.get(year);
+  if (p) return p;
+  p = fetch(`${import.meta.env.BASE_URL}data/districts-${year}.json`)
     .then((r) => r.json())
     .then((topo: Topology) => {
       type Props = { id: string; state: string; name: string };
@@ -84,9 +87,11 @@ export function loadDistricts(): Promise<District[]> {
         state: f.properties.state.toUpperCase(),
         name: f.properties.name,
         d: project(f) ?? '',
+        bounds: project.bounds(f),
       }));
     });
-  return districts;
+  districts.set(year, p);
+  return p;
 }
 
 const SUFFIX = /\s+(county|parish|borough|census area|municipality|city and borough|city)$/;

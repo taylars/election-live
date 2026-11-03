@@ -51,10 +51,58 @@ export const CHAMBER: Record<Chamber, { label: string; total: number; majority?:
 /** Add ?testdata to the page URL to have civicAPI fill races with simulated votes. */
 export const TEST_DATA = new URLSearchParams(location.search).has('testdata');
 
-export async function getRace(id: number): Promise<Race> {
-  const res = await fetch(`${API}/race/${id}${TEST_DATA ? '?testdata' : ''}`);
-  if (!res.ok) throw new Error(`civicAPI race ${id}: HTTP ${res.status}`);
-  return res.json();
+/** How long a civicAPI response is reused before it's fetched again (also the poll interval). */
+export const CACHE_TTL_MS = 5 * 60_000;
+const CACHE_PREFIX = 'civicapi:';
+
+export interface Fetched<T> {
+  data: T;
+  fetchedAt: number;
+}
+
+function readCache<T>(key: string): Fetched<T> | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as Fetched<T>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(key: string, entry: Fetched<unknown>) {
+  const value = JSON.stringify(entry);
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Probably over quota: drop our older entries and try once more, then give up quietly.
+    try {
+      Object.keys(localStorage).filter((k) => k.startsWith(CACHE_PREFIX)).forEach((k) => localStorage.removeItem(k));
+      localStorage.setItem(key, value);
+    } catch {
+      // Storage unavailable; the response is still used, just not kept.
+    }
+  }
+}
+
+/**
+ * Fetches JSON from civicAPI, reusing a localStorage copy younger than CACHE_TTL_MS
+ * so reloads and view switches don't hit the API. `force` skips the cache (refresh, polls).
+ */
+async function cachedJson<T>(url: string, force = false): Promise<Fetched<T>> {
+  const key = CACHE_PREFIX + url;
+  if (!force) {
+    const hit = readCache<T>(key);
+    if (hit && Date.now() - hit.fetchedAt < CACHE_TTL_MS) return hit;
+  }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`civicAPI ${url.replace(API, '')}: HTTP ${res.status}`);
+  const entry = { data: (await res.json()) as T, fetchedAt: Date.now() };
+  writeCache(key, entry);
+  return entry;
+}
+
+export function getRace(id: number, force = false): Promise<Fetched<Race>> {
+  return cachedJson<Race>(`${API}/race/${id}${TEST_DATA ? '?testdata' : ''}`, force);
 }
 
 export interface Rating {
@@ -71,9 +119,8 @@ const forecasts = new Map<Chamber, Promise<Record<string, Rating>>>();
 export function getForecast(chamber: Chamber): Promise<Record<string, Rating>> {
   let p = forecasts.get(chamber);
   if (!p) {
-    p = fetch(`${API}/forecast/${chamber}/2026/civicapi`)
-      .then((r) => (r.ok ? r.json() : { states: {} }))
-      .then((j) => j.states ?? {})
+    p = cachedJson<{ states?: Record<string, Rating> }>(`${API}/forecast/${chamber}/2026/civicapi`)
+      .then((j) => j.data.states ?? {})
       .catch(() => ({}));
     forecasts.set(chamber, p);
   }
@@ -109,4 +156,26 @@ export function side(party: string): Side {
   if (p.startsWith('democrat')) return 'D';
   if (p.startsWith('republican')) return 'R';
   return 'O';
+}
+
+/** Display name for a party: "Democrat" rather than civicAPI's "Democratic". */
+export function partyLabel(party: string): string {
+  const s = side(party);
+  return s === 'D' ? 'Democrat' : s === 'R' ? 'Republican' : party;
+}
+
+/** Past general-election results, built by scripts/build-past.mjs, shaped like civicAPI regions. */
+export type PastYear = Partial<Record<'president' | 'senate' | 'governor' | 'house', Record<string, Region>>>;
+
+const past = new Map<number, Promise<PastYear>>();
+
+export function getPast(year: number): Promise<PastYear> {
+  let p = past.get(year);
+  if (!p) {
+    p = fetch(`${import.meta.env.BASE_URL}data/past/${year}.json`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .catch(() => ({}));
+    past.set(year, p);
+  }
+  return p;
 }

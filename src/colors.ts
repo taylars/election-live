@@ -59,10 +59,6 @@ export function marginFill(m: number): string {
   return tint(m >= 0 ? PARTY.D : PARTY.R, 0.25 + 0.75 * Math.min(1, Math.abs(m) / 0.4));
 }
 
-export function shiftFill(delta: number): string {
-  return tint(delta >= 0 ? PARTY.D : PARTY.R, 0.15 + 0.85 * Math.min(1, Math.abs(delta) / 0.15));
-}
-
 export const TOSSUP = '#5b5540';
 
 /** Seat-bar colours for each projection tier: solid when secured, paler as it gets less certain. */

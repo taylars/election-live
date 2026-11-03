@@ -1,27 +1,25 @@
 import './style.css';
 import { geoPath } from 'd3-geo';
 import {
-  CHAMBER, NATIONAL_RACE, TEST_DATA, getForecast, getHistory, getRace, side,
-  type Candidate, type Chamber, type History, type Race, type Rating, type Region, type Side,
+  CACHE_TTL_MS, CHAMBER, NATIONAL_RACE, TEST_DATA, getForecast, getHistory, getPast, getRace, partyLabel, side,
+  type Candidate, type Chamber, type History, type PastYear, type Race, type Rating, type Region, type Side,
 } from './api';
 import {
   LEVEL_FILL, NO_DATA, NO_RACE, PARTY, TOSSUP, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
-  pastMargin, ranked, ratingFill, shiftFill,
+  pastMargin, ranked, ratingFill,
 } from './colors';
+import { ALL_YEARS, LIVE_YEAR, RACE_LABEL, SEATED, YEARS, electoralVotes, type RaceKind } from './elections';
 import { POSTAL_BY_FIPS, STATES, countyKey, loadAtlas, loadDistricts, type Atlas, type District, type Shape } from './geo';
 import { MIN_REPORTING, projectRace, projected, projectionLabel, tally } from './projection';
 
-const REFRESH_MS = 30_000;
 const W = 975;
 const H = 610;
 
-/** live = 2026 results; a year = that presidential race; shift = 2026 margin vs latest presidential. */
-type Mode = 'live' | 'shift' | `${number}`;
-
 interface Route {
-  chamber: Chamber;
+  race: RaceKind;
+  year: number;
   state?: string; // postal code, upper case
-  mode: Mode;
+  district?: string; // House only, e.g. "mi-07"
 }
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -29,7 +27,7 @@ app.innerHTML = `
   <header class="top">
     <div class="brand"><span class="dot"></span> Election Live <small>Nov 3, 2026</small>${TEST_DATA ? '<span class="chip flip">SIMULATED DATA</span>' : ''}</div>
     <nav class="tabs" id="tabs"></nav>
-    <nav class="modes" id="modes"></nav>
+    <nav class="modes" id="years"></nav>
     <div class="status" id="status">
       <span id="status-text"></span>
       <button data-action="refresh" title="Refresh now">↻ Refresh</button>
@@ -47,7 +45,9 @@ app.innerHTML = `
   </main>
   <footer class="foot">
     Live data: <a href="https://civicapi.org" target="_blank" rel="noopener">civicAPI</a> ·
-    Past results: <a href="https://github.com/tonmcg/US_County_Level_Election_Results_08-24" target="_blank" rel="noopener">tonmcg county results</a> ·
+    Past results: <a href="https://github.com/fivethirtyeight/election-results" target="_blank" rel="noopener">FiveThirtyEight</a>,
+    <a href="https://github.com/tonmcg/US_County_Level_Election_Results_08-24" target="_blank" rel="noopener">tonmcg county results</a> ·
+    District lines: civicAPI (2026), US Census Bureau (2020–2024) ·
     Results are unofficial until certified.
   </footer>`;
 
@@ -58,6 +58,7 @@ const path = geoPath();
 
 const nationalRaces = new Map<Chamber, Race>();
 const stateRaces = new Map<number, Race>();
+const pastData = new Map<number, PastYear>();
 let atlas: Atlas;
 let route: Route = parseRoute();
 let lastFetch = 0;
@@ -68,20 +69,28 @@ let tips = new Map<string, string>();
 
 // ---------- routing ----------
 
+/**
+ * Routes look like #/senate/2024/ga: race, year, then an optional state, and for
+ * the House an optional district (#/house/2024/mi/07).
+ */
 function parseRoute(): Route {
-  const [p, q] = location.hash.replace(/^#\/?/, '').split('?');
-  const [c, s] = p.split('/');
-  const chamber: Chamber = c === 'governor' || c === 'house' ? c : 'senate';
+  const [r, y, s, d] = location.hash.replace(/^#\/?/, '').split('?')[0].split('/');
+  const race: RaceKind = r in RACE_LABEL ? (r as RaceKind) : 'senate';
+  const year = YEARS[race].includes(Number(y)) ? Number(y) : YEARS[race][0];
   const state = s && STATES[s.toUpperCase()] ? s.toUpperCase() : undefined;
-  const m = new URLSearchParams(q).get('mode') ?? 'live';
-  const mode = (m === 'shift' || /^\d{4}$/.test(m) ? m : 'live') as Mode;
-  return { chamber, state, mode };
+  const district = race === 'house' && state && /^(\d{2}|al)$/.test(d ?? '') ? `${state.toLowerCase()}-${d}` : undefined;
+  return { race, year, state, district };
 }
 
 function href(r: Partial<Route>): string {
   const next = { ...route, ...r };
-  const mode = next.mode === 'live' ? '' : `?mode=${next.mode}`;
-  return `#/${next.chamber}${next.state ? `/${next.state.toLowerCase()}` : ''}${mode}`;
+  // Keep the year when switching race if that race has one; otherwise its latest.
+  const year = YEARS[next.race].includes(next.year) ? next.year : YEARS[next.race][0];
+  // A district only makes sense in the House view of its own state.
+  const district = next.race === 'house' && next.state && next.district?.startsWith(`${next.state.toLowerCase()}-`)
+    ? `/${next.district.split('-')[1]}`
+    : '';
+  return `#/${next.race}/${year}${next.state ? `/${next.state.toLowerCase()}` : ''}${district}`;
 }
 
 window.addEventListener('hashchange', () => {
@@ -89,39 +98,69 @@ window.addEventListener('hashchange', () => {
   load();
 });
 
+const isLive = (r: Route = route) => r.year === LIVE_YEAR && r.race !== 'president';
+
 // ---------- data ----------
 
-function stateRegion(chamber: Chamber, postal: string): Region | undefined {
-  return nationalRaces.get(chamber)?.region_results?.[postal.toLowerCase()];
+/** The current view's results: civicAPI regions for 2026, packaged results for past years. */
+function currentRegions(): Record<string, Region> {
+  if (isLive()) return nationalRaces.get(route.race as Chamber)?.region_results ?? {};
+  return pastData.get(route.year)?.[route.race] ?? {};
 }
 
-function houseDistricts(postal: string): [string, Region][] {
-  const all = Object.entries(nationalRaces.get('house')?.region_results ?? {});
-  return all.filter(([k]) => k.startsWith(`${postal.toLowerCase()}-`));
+/** A state's races in the current view: the regular one first, then any special. */
+function stateRaceRegions(regions: Record<string, Region>, postal: string): [string, Region][] {
+  const k = postal.toLowerCase();
+  return [k, `${k}-special`].filter((key) => regions[key]).map((key) => [key, regions[key]]);
 }
 
-async function fetchCurrent() {
-  const { chamber, state } = route;
-  nationalRaces.set(chamber, await getRace(NATIONAL_RACE[chamber]));
-  const id = state && chamber !== 'house' ? stateRegion(chamber, state)?.election_id : undefined;
-  if (id) stateRaces.set(id, await getRace(id));
-  lastFetch = Date.now();
+function districtsIn(regions: Record<string, Region>, postal: string): [string, Region][] {
+  const prefix = `${postal.toLowerCase()}-`;
+  return Object.entries(regions)
+    .filter(([k]) => k.startsWith(prefix) && k !== `${prefix}special`)
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
+}
+
+/**
+ * Loads the live view's races. Without `force`, a localStorage copy under five minutes
+ * old is reused; the refresh button and the poll pass `force` to go to civicAPI.
+ */
+async function fetchCurrent(force = false) {
+  if (!isLive()) return;
+  const chamber = route.race as Chamber;
+  const national = await getRace(NATIONAL_RACE[chamber], force);
+  nationalRaces.set(chamber, national.data);
+  let oldest = national.fetchedAt;
+  // A state's race, or a House district's, carries the county breakdown.
+  const detailKey = chamber === 'house' ? route.district : route.state?.toLowerCase();
+  const id = detailKey ? national.data.region_results?.[detailKey]?.election_id : undefined;
+  if (id) {
+    const state = await getRace(id, force);
+    stateRaces.set(id, state.data);
+    oldest = Math.min(oldest, state.fetchedAt);
+  }
+  lastFetch = oldest;
 }
 
 async function load() {
-  render(); // immediate feedback from whatever is cached
+  render(); // immediate feedback from whatever is in memory
   try {
     atlas ??= await loadAtlas();
-    const needsFetch =
-      !nationalRaces.has(route.chamber) ||
-      (route.state && route.chamber !== 'house' && !stateRaces.has(stateRegion(route.chamber, route.state)?.election_id ?? -1));
-    await Promise.all([
-      needsFetch ? fetchCurrent() : null,
-      getForecast(route.chamber),
-      getHistory('national'),
-      route.state ? getHistory(STATES[route.state].fips) : null,
-      route.chamber === 'house' ? loadDistricts() : null,
-    ]);
+    const { race, year, state } = route;
+    const tasks: Promise<unknown>[] = [];
+    if (isLive()) {
+      // Cheap when cached; also resets the "updated" time to this view's data.
+      tasks.push(fetchCurrent());
+      tasks.push(getForecast(race as Chamber));
+    }
+    // A district page lists the seat's results from every past year.
+    const pastYears = route.district ? ALL_YEARS.filter((y) => y !== LIVE_YEAR) : isLive() ? [] : [year];
+    for (const y of pastYears) {
+      if (!pastData.has(y)) tasks.push(getPast(y).then((p) => pastData.set(y, p)));
+    }
+    if (race === 'house') tasks.push(loadDistricts(year));
+    if (race === 'president' && state) tasks.push(getHistory(STATES[state].fips));
+    await Promise.all(tasks);
     error = '';
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
@@ -148,7 +187,7 @@ function setPolling(on: boolean) {
 
 async function refresh() {
   try {
-    await fetchCurrent();
+    await fetchCurrent(true);
     error = '';
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
@@ -158,7 +197,8 @@ async function refresh() {
 
 let refreshing = false;
 setInterval(async () => {
-  if (polling && !refreshing && document.visibilityState === 'visible' && Date.now() - lastFetch >= REFRESH_MS) {
+  const due = isLive() && polling && !refreshing && document.visibilityState === 'visible' && Date.now() - lastFetch >= CACHE_TTL_MS;
+  if (due) {
     refreshing = true;
     await refresh();
     refreshing = false;
@@ -185,41 +225,59 @@ $('#status').addEventListener('click', async (e) => {
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const pct = (n: number) => `${n.toFixed(1)}%`;
 const num = (n: number) => n.toLocaleString('en-US');
-const lastName = (n: string) => n.replace(/\s+(jr\.?|sr\.?|ii|iii|iv)$/i, '').split(/\s+/).at(-1) ?? n;
+const lastName = (n: string) => n.replace(/,?\s+(jr\.?|sr\.?|ii|iii|iv)$/i, '').split(/\s+/).at(-1) ?? n;
+const totalVotes = (cands: Candidate[]) => cands.reduce((s, c) => s + c.votes, 0);
+const winnerOf = (cands: Candidate[]) => cands.find((c) => c.winner);
+
+/** Top-two margin as a share of the vote (always positive), or null with no votes. */
+function topMargin(cands: Candidate[]): number | null {
+  const [a, b] = ranked(cands);
+  const total = totalVotes(cands);
+  return a && total ? (a.votes - (b?.votes ?? 0)) / total : null;
+}
+
+/** Map colour for a race: live shows calls and leads (forecast before votes); past shows margins. */
+function raceFill(region: Region | undefined, rating?: string): string {
+  if (!region) return NO_DATA;
+  if (isLive()) return liveFill(region.candidates) ?? ratingFill(rating) ?? NO_DATA;
+  return liveFill(region.candidates, false) ?? NO_DATA;
+}
 
 async function render() {
   renderTabs();
+  renderStatus();
   if (!atlas) {
     $('#panel').innerHTML = `<p class="muted">Loading maps…</p>`;
     return;
   }
-  const history = await getHistory('national');
-  const years = Object.keys(history).sort().reverse();
-  renderModes(years);
-  renderStatus();
   tips = new Map();
   tip.hidden = true;
-  if (route.state) await renderState(years);
-  else await renderNation(history);
+  if (route.state) await renderState();
+  else await renderNation();
 }
 
 function renderTabs() {
-  $('#tabs').innerHTML = (Object.keys(CHAMBER) as Chamber[])
-    .map((c) => `<a href="${href({ chamber: c })}" class="${c === route.chamber ? 'on' : ''}">${CHAMBER[c].label}</a>`)
+  $('#tabs').innerHTML = (Object.keys(RACE_LABEL) as RaceKind[])
+    .map((r) => `<a href="${href({ race: r })}" class="${r === route.race ? 'on' : ''}">${RACE_LABEL[r]}</a>`)
     .join('');
-}
-
-function renderModes(years: string[]) {
-  const modes: [Mode, string][] = [['live', '2026 live']];
-  for (const y of years) modes.push([y as Mode, `${y} pres.`]);
-  if (route.state && route.chamber !== 'house' && years[0]) modes.push(['shift', `Shift vs ${years[0]}`]);
-  $('#modes').innerHTML = modes
-    .map(([m, label]) => `<a href="${href({ mode: m })}" class="${m === route.mode ? 'on' : ''}">${label}</a>`)
-    .join('');
+  $('#years').innerHTML = ALL_YEARS.map((y) => {
+    const label = `${y === LIVE_YEAR ? '<span class="livedot"></span>' : ''}${y}`;
+    if (!YEARS[route.race].includes(y)) {
+      return `<span class="off" title="No ${RACE_LABEL[route.race].toLowerCase()} race in ${y}">${label}</span>`;
+    }
+    return `<a href="${href({ year: y })}" class="${y === route.year ? 'on' : ''}">${label}</a>`;
+  }).join('');
 }
 
 function renderStatus() {
+  const status = $('#status');
   const text = $('#status-text');
+  const live = isLive();
+  status.classList.toggle('final', !live);
+  if (!live) {
+    text.innerHTML = `Final results · ${route.year}`;
+    return;
+  }
   const refreshBtn = $<HTMLButtonElement>('#status [data-action="refresh"]');
   const toggle = $('#status [data-action="toggle"]');
   refreshBtn.disabled = refreshing;
@@ -233,9 +291,10 @@ function renderStatus() {
     text.textContent = 'Loading…';
   } else {
     const t = new Date(lastFetch).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-    const next = Math.max(0, Math.ceil((REFRESH_MS - (Date.now() - lastFetch)) / 1000));
+    const left = Math.max(0, Math.ceil((CACHE_TTL_MS - (Date.now() - lastFetch)) / 1000));
+    const next = left >= 60 ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}` : `${left}s`;
     text.innerHTML = polling
-      ? `<span class="live"></span>Updated ${t} · next in ${next}s`
+      ? `<span class="live"></span>Updated ${t} · next in ${next}`
       : `<span class="live paused"></span>Updated ${t} · paused`;
   }
 }
@@ -258,18 +317,16 @@ function drawShapes(shapes: (Drawn & ({ shape: Shape } | { district: District })
       .join('') + extra;
 }
 
-/** Colours one House district by its live result, or by forecast rating before votes. */
-function districtShape(district: District, forecast: Record<string, Rating>, link?: string) {
-  const region = nationalRaces.get('house')?.region_results?.[district.id];
+function districtShape(district: District, regions: Record<string, Region>, forecast: Record<string, Rating>, link?: string) {
+  const region = regions[district.id];
   const rating = forecast[district.id.toUpperCase()];
-  const fill = (region && liveFill(region.candidates)) ?? ratingFill(rating?.rating) ?? NO_DATA;
   tips.set(
     district.id,
-    `<b>${esc(district.id.toUpperCase())}</b>${rating ? ` <span class="chip">${esc(rating.rating)}</span>` : ''}
+    `<b>${esc(district.id.toUpperCase())}</b>${rating && isLive() ? ` <span class="chip">${esc(rating.rating)}</span>` : ''}
      <div class="muted">${esc(district.name)}</div>
-     ${region ? `<div class="mini">${candidateRows(region.candidates, 3)}</div><div class="muted">${pct(region.percent_reporting)} reporting</div>` : ''}`,
+     ${region ? `<div class="mini">${candidateRows(region.candidates, 3)}</div>${isLive() ? `<div class="muted">${pct(region.percent_reporting)} reporting</div>` : ''}` : '<div class="muted">No result in data</div>'}`,
   );
-  return { district, fill, cls: 'race district', link };
+  return { district, fill: raceFill(region, rating?.rating), cls: 'race district', link };
 }
 
 svg.addEventListener('mousemove', (e) => {
@@ -290,7 +347,7 @@ svg.addEventListener('mousemove', (e) => {
 svg.addEventListener('mouseleave', () => (tip.hidden = true));
 
 function candidateRows(cands: Candidate[], limit = 6): string {
-  const total = cands.reduce((s, c) => s + c.votes, 0);
+  const total = totalVotes(cands);
   return ranked(cands)
     .slice(0, limit)
     .map((c) => {
@@ -299,7 +356,7 @@ function candidateRows(cands: Candidate[], limit = 6): string {
         <div class="cand ${c.winner ? 'won' : ''}">
           <span class="swatch" style="background:${partyColor(c)}"></span>
           <span class="name">${esc(c.name)}${c.incumbent ? ' <i title="Incumbent">inc.</i>' : ''}${c.winner ? ' <b class="check">✓</b>' : ''}
-            <small>${esc(c.party)}</small></span>
+            <small>${esc(partyLabel(c.party))}</small></span>
           <span class="pct">${total ? pct(share) : '–'}</span>
           <span class="votes">${num(c.votes)}</span>
           <span class="bar"><span style="width:${share}%;background:${partyColor(c)}"></span></span>
@@ -308,74 +365,174 @@ function candidateRows(cands: Candidate[], limit = 6): string {
     .join('');
 }
 
-function legend(kind: 'live' | 'past' | 'shift', note = '') {
-  const items =
-    kind === 'shift'
-      ? [[shiftFill(0.15), 'Shift toward D'], [shiftFill(0.02), 'Small shift'], [shiftFill(-0.15), 'Shift toward R']]
-      : kind === 'past'
-        ? [[marginFill(0.4), 'D +40'], [marginFill(0.05), 'D +5'], [marginFill(-0.05), 'R +5'], [marginFill(-0.4), 'R +40']]
-        : [[PARTY.D, 'D called'], [liveFill([{ party: 'Democratic', votes: 52, color: '', name: '', percent: 0, winner: false }, { party: 'Republican', votes: 48, color: '', name: '', percent: 0, winner: false }])!, 'D leading'],
-           [liveFill([{ party: 'Republican', votes: 52, color: '', name: '', percent: 0, winner: false }, { party: 'Democratic', votes: 48, color: '', name: '', percent: 0, winner: false }])!, 'R leading'], [PARTY.R, 'R called'], [NO_DATA, 'No votes yet']];
+const sample = (lead: string, trail: string) => [
+  { party: lead, votes: 52, color: '', name: '', percent: 0, winner: false },
+  { party: trail, votes: 48, color: '', name: '', percent: 0, winner: false },
+];
+
+function legend(note = '') {
+  const items = isLive()
+    ? [[PARTY.D, 'D called'], [liveFill(sample('Democrat', 'Republican'))!, 'D leading'],
+       [liveFill(sample('Republican', 'Democrat'))!, 'R leading'], [PARTY.R, 'R called'], [NO_DATA, 'No votes yet']]
+    : [[marginFill(0.4), 'D +40'], [marginFill(0.05), 'D +5'], [marginFill(-0.05), 'R +5'], [marginFill(-0.4), 'R +40']];
   $('#legend').innerHTML =
     items.map(([c, l]) => `<span><i style="background:${c}"></i>${l}</span>`).join('') +
     (note ? `<span class="muted">${note}</span>` : '');
 }
 
+const FORECAST_NOTE = 'Lighter shades before votes: forecast rating';
+
 // ----- national view -----
 
-async function renderNation(history: History) {
-  const { chamber, mode } = route;
-  const race = nationalRaces.get(chamber);
-  const forecast = await getForecast(chamber);
-  $('#crumbs').innerHTML = `<b>United States</b> · ${CHAMBER[chamber].label}`;
+async function renderNation() {
+  const { race, year } = route;
+  const regions = currentRegions();
+  const forecast = isLive() ? await getForecast(race as Chamber) : {};
+  $('#crumbs').innerHTML = `<b>United States</b> · ${year} ${RACE_LABEL[race]}`;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const panel = $('#panel');
 
-  const past = mode !== 'live' && mode !== 'shift' ? history[mode] : undefined;
-  if (chamber === 'house' && !past) {
-    const districts = await loadDistricts();
+  if (race === 'house') {
+    const districts = await loadDistricts(year);
     drawShapes(
-      districts.map((d) => districtShape(d, forecast, href({ state: d.state }))),
+      districts.map((d) => districtShape(d, regions, forecast, href({ state: d.state }))),
       `<path class="borders" d="${path(atlas.stateBorders)}"/><path class="borders" d="${path(atlas.nation as never)}"/>`,
     );
-    legend('live', 'Lighter shades before votes: forecast rating');
-    $('#panel').innerHTML = race ? balance(race, forecast) + houseList(race) : `<p class="muted">Loading results…</p>`;
+    legend(isLive() ? FORECAST_NOTE : '');
+    const national = nationalRaces.get('house');
+    if (isLive() && !national) panel.innerHTML = `<p class="muted">Loading results…</p>`;
+    else panel.innerHTML = (isLive() ? balance(national!, forecast) : houseTally(regions)) + houseList(regions);
     return;
   }
+
   let usedForecast = false;
   const shapes = atlas.states.map((shape) => {
     const postal = POSTAL_BY_FIPS[shape.id];
     const name = STATES[postal]?.name ?? shape.properties.name;
-    if (past) {
-      const p = past[shape.id];
-      if (!p) return { shape, fill: NO_RACE };
-      tips.set(shape.id, `<b>${name}</b><div>${mode} president: ${fmtMargin(pastMargin(p))}</div><div class="muted">${num(p.t)} votes</div>`);
-      return { shape, fill: marginFill(pastMargin(p)), link: href({ state: postal }) };
-    }
-    const region = postal && stateRegion(chamber, postal);
-    if (!region) {
-      tips.set(shape.id, `<b>${name}</b><div class="muted">No ${CHAMBER[chamber].label.toLowerCase()} race</div>`);
+    const races = postal ? stateRaceRegions(regions, postal) : [];
+    if (!races.length) {
+      tips.set(shape.id, `<b>${name}</b><div class="muted">No ${RACE_LABEL[race].toLowerCase()} race in ${year}</div>`);
       return { shape, fill: NO_RACE };
     }
-    let fill = liveFill(region.candidates);
-    const rating = forecast[postal];
-    if (!fill) {
-      fill = ratingFill(rating?.rating) ?? NO_DATA;
-      usedForecast ||= !!rating;
-    }
-    tips.set(shape.id, `<b>${esc(region.name)}</b>${rating ? ` <span class="chip">${esc(rating.rating)}</span>` : ''}
-      <div class="mini">${candidateRows(region.candidates, 3)}</div>
-      <div class="muted">${pct(region.percent_reporting)} reporting</div>`);
-    return { shape, fill, cls: 'race', link: href({ state: postal }) };
+    const rating = forecast[postal]?.rating;
+    usedForecast ||= isLive() && !!rating && !totalVotes(races[0][1].candidates);
+    const ev = race === 'president' ? ` <span class="chip">${evForState(postal)} EV</span>` : '';
+    tips.set(
+      shape.id,
+      races
+        .map(([, reg], i) => `<b>${esc(i ? reg.name : name)}</b>${ev && !i ? ev : ''}${rating && isLive() && !i ? ` <span class="chip">${esc(rating)}</span>` : ''}
+          <div class="mini">${candidateRows(reg.candidates, 3)}</div>${isLive() ? `<div class="muted">${pct(reg.percent_reporting)} reporting</div>` : ''}`)
+        .join(''),
+    );
+    return { shape, fill: raceFill(races[0][1], rating), cls: 'race', link: href({ state: postal }) };
   });
   drawShapes(shapes, `<path class="borders" d="${path(atlas.nation as never)}"/>`);
-  legend(past ? 'past' : 'live', usedForecast ? 'Lighter shades before votes: forecast rating' : '');
+  legend(usedForecast ? FORECAST_NOTE : '');
 
-  const panel = $('#panel');
-  if (!race) {
+  if (isLive() && !nationalRaces.get(race as Chamber)) {
     panel.innerHTML = `<p class="muted">Loading results…</p>`;
     return;
   }
-  panel.innerHTML = balance(race, forecast) + (past ? pastSummary(past, mode) : raceList(race, forecast));
+  const head =
+    race === 'president' ? electoralTally(regions)
+    : isLive() ? balance(nationalRaces.get(race as Chamber)!, forecast)
+    : seatedTally(regions);
+  panel.innerHTML = head + raceList(regions, forecast);
+}
+
+function evForState(postal: string): number {
+  return electoralVotes(route.year, postal.toLowerCase()) +
+    (postal === 'ME' ? 2 : postal === 'NE' ? 3 : 0); // plus each district's single vote
+}
+
+/** A seat bar with the majority line, plus headline numbers and notes. */
+function seatBar(parts: { n: number; color: string; title: string }[], total: number, majority?: number): string {
+  const w = (n: number) => `${(n / total) * 100}%`;
+  return `<div class="seatbar">${parts
+    .filter((p) => p.n > 0)
+    .map((p) => `<span style="width:${w(p.n)};background:${p.color}" title="${p.title}: ${p.n}"></span>`)
+    .join('')}${majority ? `<i class="maj" style="left:${w(majority)}"></i>` : ''}</div>`;
+}
+
+function headline(s: Side, big: string | number, sub = '', badge = '') {
+  return `<div class="side ${s}"><b style="color:${PARTY[s]}">${big}</b>${sub ? `<span>${sub}</span>` : ''}${badge ? `<em>${badge}</em>` : ''}</div>`;
+}
+
+function electoralTally(regions: Record<string, Region>): string {
+  const ev: Record<Side, number> = { D: 0, R: 0, O: 0 };
+  const names: Partial<Record<Side, string>> = {};
+  for (const [key, reg] of Object.entries(regions)) {
+    const w = winnerOf(reg.candidates);
+    if (!w) continue;
+    const s = side(w.party);
+    ev[s] += electoralVotes(route.year, key);
+    names[s] ??= lastName(w.name);
+  }
+  const win = (s: Side) => (ev[s] >= 270 ? 'won' : '');
+  return `
+    <div class="balance">
+      <div class="nums">
+        ${headline('D', ev.D, names.D ?? 'Democrat', win('D'))}
+        ${ev.O ? headline('O', ev.O, 'Other') : ''}
+        ${headline('R', ev.R, names.R ?? 'Republican', win('R'))}
+      </div>
+      ${seatBar([
+        { n: ev.D, color: PARTY.D, title: 'Democrat' },
+        { n: ev.O, color: PARTY.O, title: 'Other' },
+        { n: 538 - ev.D - ev.R - ev.O, color: '#3a4150', title: 'Unallocated' },
+        { n: ev.R, color: PARTY.R, title: 'Republican' },
+      ], 538, 270)}
+      <div class="muted">Electoral votes · 270 to win · Maine and Nebraska split by district</div>
+    </div>`;
+}
+
+/** Past Senate/Governor: the chamber as seated afterwards, and what changed hands that year. */
+function seatedTally(regions: Record<string, Region>): string {
+  const kind = route.race as 'senate' | 'governor';
+  const info = CHAMBER[kind];
+  const seated = SEATED[kind][route.year];
+  const won: Record<Side, number> = { D: 0, R: 0, O: 0 };
+  for (const reg of Object.values(regions)) {
+    const w = winnerOf(reg.candidates);
+    if (w) won[side(w.party)]++;
+  }
+  const control = (s: Side) => (info.majority && seated[s] >= info.majority ? 'majority' : '');
+  return `
+    <div class="balance">
+      <div class="nums">
+        ${headline('D', `D ${seated.D}`, '', control('D'))}
+        ${seated.O ? headline('O', `Ind ${seated.O}`) : ''}
+        ${headline('R', `R ${seated.R}`, '', control('R'))}
+      </div>
+      ${seatBar([
+        { n: seated.D, color: PARTY.D, title: 'Democrat' },
+        { n: seated.O, color: PARTY.O, title: 'Independent' },
+        { n: seated.R, color: PARTY.R, title: 'Republican' },
+      ], info.total, info.majority)}
+      <div class="breakdown">Won in ${route.year}: <span style="color:${PARTY.D}">D ${won.D}</span> · <span style="color:${PARTY.R}">R ${won.R}</span>${won.O ? ` · Oth ${won.O}` : ''}</div>
+      <div class="muted">${info.label === 'Senate' ? 'Senate' : 'Governors'} as seated in January ${route.year + 1}${seated.O ? '; independents caucused with Democrats' : ''}.</div>
+    </div>`;
+}
+
+function houseTally(regions: Record<string, Region>): string {
+  const won: Record<Side, number> = { D: 0, R: 0, O: 0 };
+  for (const reg of Object.values(regions)) {
+    const w = winnerOf(reg.candidates);
+    if (w) won[side(w.party)]++;
+  }
+  const missing = 435 - won.D - won.R - won.O;
+  const control = (s: Side) => (won[s] >= 218 ? 'majority' : '');
+  return `
+    <div class="balance">
+      <div class="nums">${headline('D', `D ${won.D}`, '', control('D'))}${headline('R', `R ${won.R}`, '', control('R'))}</div>
+      ${seatBar([
+        { n: won.D, color: PARTY.D, title: 'Democrat' },
+        { n: won.O, color: PARTY.O, title: 'Other' },
+        { n: missing, color: '#3a4150', title: 'Not in data' },
+        { n: won.R, color: PARTY.R, title: 'Republican' },
+      ], 435, 218)}
+      <div class="muted">Seats won in ${route.year} · 218 for control${missing ? ` · ${missing} uncontested seats not in the data` : ''}</div>
+    </div>`;
 }
 
 /** Seats not up this year, by party, from the roll-up race's seat counts. */
@@ -386,42 +543,33 @@ function holdovers(race: Race): Record<Side, number> {
   // civicAPI's seat counts are holdovers only (they sum to total minus races up).
   // If they ever start including calls too, take those back out so calls aren't counted twice.
   const sum = seats('D') + seats('R') + seats('O');
-  const includesCalls = sum + regions.length > CHAMBER[route.chamber].total;
+  const includesCalls = sum + regions.length > CHAMBER[route.race as Chamber].total;
   const h = (s: Side) => Math.max(0, seats(s) - (includesCalls ? called(s) : 0));
   return { D: h('D'), R: h('R'), O: h('O') };
 }
 
+/** Live tally: secured seats plus the projection for every uncalled race. */
 function balance(race: Race, forecast: Record<string, Rating>): string {
-  const info = CHAMBER[route.chamber];
+  const info = CHAMBER[route.race as Chamber];
   const t = tally(race.region_results ?? {}, forecast, holdovers(race));
-  const w = (n: number) => `${(n / info.total) * 100}%`;
-  const seg = (n: number, color: string, title: string) =>
-    n ? `<span style="width:${w(n)};background:${color}" title="${title}: ${n}"></span>` : '';
-  const sideBar = (s: Side, order: ('secured' | 'likely' | 'lean')[]) =>
-    order.map((lvl) => seg(t[s][lvl], LEVEL_FILL[lvl](s), `${s} ${lvl}`)).join('');
-  const secured = (s: Side) => t[s].secured;
-  const proj = (s: Side) => projected(t, s);
+  const tiers = (s: Side, order: ('secured' | 'likely' | 'lean')[]) =>
+    order.map((lvl) => ({ n: t[s][lvl], color: LEVEL_FILL[lvl](s), title: `${s} ${lvl}` }));
   const status = (s: Side) =>
-    info.majority && secured(s) >= info.majority ? 'wins control' : info.majority && proj(s) >= info.majority ? 'projected control' : '';
-  const sideNums = (s: Side) => `
-    <div class="side ${s}">
-      <b style="color:${PARTY[s]}">${s === 'O' ? 'Oth' : s} ${secured(s)}</b>
-      <span>Projected <b>${proj(s)}</b></span>
-      ${status(s) ? `<em>${status(s)}</em>` : ''}
-    </div>`;
+    info.majority && t[s].secured >= info.majority ? 'wins control' : info.majority && projected(t, s) >= info.majority ? 'projected control' : '';
+  const nums = (s: Side) => headline(s, `${s === 'O' ? 'Oth' : s} ${t[s].secured}`, `Projected <b>${projected(t, s)}</b>`, status(s));
   const breakdown = (s: Side) =>
     `<span style="color:${PARTY[s]}">${s}</span> ${t[s].secured} secured · ${t[s].likely} likely · ${t[s].lean} lean`;
   return `
     <div class="balance">
-      <div class="nums">${sideNums('D')}${t.O.secured + t.O.likely + t.O.lean ? sideNums('O') : ''}${sideNums('R')}</div>
-      <div class="seatbar">
-        ${sideBar('D', ['secured', 'likely', 'lean'])}${sideBar('O', ['secured', 'likely', 'lean'])}
-        ${seg(t.tossup, TOSSUP, 'Toss-up')}
-        ${sideBar('R', ['lean', 'likely', 'secured'])}
-        ${info.majority ? `<i class="maj" style="left:${w(info.majority)}"></i>` : ''}
-      </div>
+      <div class="nums">${nums('D')}${projected(t, 'O') ? nums('O') : ''}${nums('R')}</div>
+      ${seatBar([
+        ...tiers('D', ['secured', 'likely', 'lean']),
+        ...tiers('O', ['secured', 'likely', 'lean']),
+        { n: t.tossup, color: TOSSUP, title: 'Toss-up' },
+        ...tiers('R', ['lean', 'likely', 'secured']),
+      ], info.total, info.majority)}
       <div class="breakdown">${breakdown('D')}<br>${breakdown('R')}<br>${t.tossup} toss-up${info.majority ? ` · ${info.majority} for control` : ''}</div>
-      <div class="muted">Big numbers are secured seats: called races${route.chamber === 'house' ? '' : ' and seats not up this year'}.
+      <div class="muted">Big numbers are secured seats: called races${route.race === 'house' ? '' : ' and seats not up this year'}.
         Projections use forecast ratings until ${MIN_REPORTING}% of a race reports, then live margins and the vote still out.</div>
     </div>`;
 }
@@ -432,31 +580,39 @@ function projectionChip(p: ReturnType<typeof projectRace>): string {
   return `<span class="chip" style="color:${color}" title="${title}">${projectionLabel(p)}${p.source === 'live' ? ' •' : ''}</span>`;
 }
 
-function raceList(race: Race, forecast: Record<string, Rating>): string {
-  const rows = Object.entries(race.region_results ?? {}).map(([key, reg]) => {
-    const postal = key.toUpperCase();
-    const top = ranked(reg.candidates);
-    const total = reg.candidates.reduce((s, c) => s + c.votes, 0);
-    const margin = total && top[1] ? (top[0].votes - top[1].votes) / total : 1;
-    const winner = reg.candidates.find((c) => c.winner);
-    const inc = forecast[postal]?.incumbent_party;
-    const flip = winner && inc && side(winner.party) !== inc && side(winner.party) !== 'O';
-    const projection = projectRace(reg.candidates, reg.percent_reporting, forecast[postal]?.rating);
-    return { postal, reg, top, total, margin, winner, flip, projection };
-  });
-  // Races with votes and no call first, closest first; then the rest alphabetically.
+function raceList(regions: Record<string, Region>, forecast: Record<string, Rating>): string {
+  const live = isLive();
+  const rows = Object.entries(regions)
+    // Maine/Nebraska presidential districts show in their state's view.
+    .filter(([key]) => !(route.race === 'president' && key.includes('-')))
+    .map(([key, reg]) => {
+      const postal = key.split('-')[0].toUpperCase();
+      const top = ranked(reg.candidates);
+      const total = totalVotes(reg.candidates);
+      const margin = topMargin(reg.candidates) ?? 1;
+      const winner = winnerOf(reg.candidates);
+      const rating = forecast[postal];
+      const flip = live && winner && rating?.incumbent_party && side(winner.party) !== rating.incumbent_party && side(winner.party) !== 'O';
+      const projection = projectRace(reg.candidates, reg.percent_reporting, rating?.rating);
+      const title = (STATES[postal]?.name ?? reg.name) + (key.endsWith('-special') ? ' (special)' : '');
+      return { postal, reg, top, total, margin, winner, flip, projection, title };
+    });
   rows.sort((a, b) => {
+    if (!live) return a.margin - b.margin; // closest first
+    // Live: races with votes and no call first, closest first; then the rest alphabetically.
     const ka = a.total && !a.winner ? 0 : 1;
     const kb = b.total && !b.winner ? 0 : 1;
-    return ka - kb || (ka === 0 ? a.margin - b.margin : a.reg.name.localeCompare(b.reg.name));
+    return ka - kb || (ka === 0 ? a.margin - b.margin : a.title.localeCompare(b.title));
   });
-  return `<h3>Races</h3><div class="cards">${rows
+  return `<h3>${live ? 'Races' : 'Closest races'}</h3><div class="cards">${rows
     .map(
       (r) => `
       <a class="card" href="${href({ state: r.postal })}">
-        <div class="card-h"><b>${esc(STATES[r.postal]?.name ?? r.reg.name)}</b>
-          ${r.flip ? '<span class="chip flip">FLIP</span>' : ''}${!r.winner && r.projection.source !== 'none' ? projectionChip(r.projection) : ''}
-          <span class="muted">${pct(r.reg.percent_reporting)}</span></div>
+        <div class="card-h"><b>${esc(r.title)}</b>
+          ${r.flip ? '<span class="chip flip">FLIP</span>' : ''}
+          ${live && !r.winner && r.projection.source !== 'none' ? projectionChip(r.projection) : ''}
+          ${route.race === 'president' ? `<span class="chip">${evForState(r.postal)} EV</span>` : ''}
+          <span class="muted">${live ? pct(r.reg.percent_reporting) : ''}</span></div>
         ${r.top
           .slice(0, 2)
           .map((c) => `<div class="line"><i style="background:${partyColor(c)}"></i>${esc(lastName(c.name))}${c.winner ? ' ✓' : ''}<span>${r.total ? pct((c.votes / r.total) * 100) : ''}</span></div>`)
@@ -466,185 +622,275 @@ function raceList(race: Race, forecast: Record<string, Rating>): string {
     .join('')}</div>`;
 }
 
-function houseList(race: Race): string {
+function houseList(regions: Record<string, Region>): string {
+  const live = isLive();
   const byState = new Map<string, Region[]>();
-  for (const [k, reg] of Object.entries(race.region_results ?? {})) {
+  for (const [k, reg] of Object.entries(regions)) {
     const p = k.split('-')[0].toUpperCase();
     byState.set(p, [...(byState.get(p) ?? []), reg]);
   }
-  const close = Object.entries(race.region_results ?? {})
-    .map(([k, reg]) => {
-      const [a, b] = ranked(reg.candidates);
-      const total = reg.candidates.reduce((s, c) => s + c.votes, 0);
-      return { k, reg, a, margin: total && b ? (a.votes - b.votes) / total : 2 };
-    })
-    .filter((x) => x.margin < 2 && !x.reg.candidates.some((c) => c.winner))
-    .sort((x, y) => x.margin - y.margin)
+  const close = Object.entries(regions)
+    .map(([k, reg]) => ({ k, reg, a: ranked(reg.candidates)[0], margin: topMargin(reg.candidates) }))
+    .filter((x) => x.margin != null && (!live || !winnerOf(x.reg.candidates)))
+    .sort((x, y) => x.margin! - y.margin!)
     .slice(0, 12);
   return `
-    ${close.length ? `<h3>Closest uncalled districts</h3><div class="cards">${close
-      .map((x) => `<a class="card" href="${href({ state: x.k.split('-')[0].toUpperCase() })}"><div class="card-h"><b>${x.k.toUpperCase()}</b><span class="muted">${pct(x.reg.percent_reporting)}</span></div>
-        <div class="line"><i style="background:${partyColor(x.a)}"></i>${esc(lastName(x.a.name))} +${(x.margin * 100).toFixed(1)}</div></a>`)
+    ${close.length ? `<h3>${live ? 'Closest uncalled districts' : 'Closest districts'}</h3><div class="cards">${close
+      .map((x) => `<a class="card" href="${href({ state: x.k.split('-')[0].toUpperCase() })}"><div class="card-h"><b>${x.k.toUpperCase()}</b><span class="muted">${live ? pct(x.reg.percent_reporting) : ''}</span></div>
+        <div class="line"><i style="background:${partyColor(x.a)}"></i>${esc(lastName(x.a.name))}${x.a.winner ? ' ✓' : ''} +${(x.margin! * 100).toFixed(1)}</div></a>`)
       .join('')}</div>` : ''}
     <h3>States</h3><div class="cards">${[...byState]
       .sort(([a], [b]) => (STATES[a]?.name ?? a).localeCompare(STATES[b]?.name ?? b))
       .map(([p, regs]) => {
         const won = (s: string) => regs.filter((r) => r.candidates.some((c) => c.winner && side(c.party) === s)).length;
         return `<a class="card" href="${href({ state: p })}"><div class="card-h"><b>${esc(STATES[p]?.name ?? p)}</b><span class="muted">${regs.length}</span></div>
-          <div class="line">Called: <span style="color:${PARTY.D}">D ${won('D')}</span> · <span style="color:${PARTY.R}">R ${won('R')}</span></div></a>`;
+          <div class="line">${live ? 'Called' : 'Won'}: <span style="color:${PARTY.D}">D ${won('D')}</span> · <span style="color:${PARTY.R}">R ${won('R')}</span></div></a>`;
       })
-      .join('')}</div>`;
-}
-
-function pastSummary(past: Record<string, { d: number; r: number; t: number }>, year: string): string {
-  const d = Object.values(past).reduce((s, p) => s + p.d, 0);
-  const r = Object.values(past).reduce((s, p) => s + p.r, 0);
-  const t = Object.values(past).reduce((s, p) => s + p.t, 0);
-  const close = Object.entries(past)
-    .map(([f, p]) => ({ postal: POSTAL_BY_FIPS[f], m: pastMargin(p) }))
-    .sort((a, b) => Math.abs(a.m) - Math.abs(b.m))
-    .slice(0, 10);
-  return `
-    <h3>${year} presidential popular vote</h3>
-    <div class="cand"><span class="swatch" style="background:${PARTY.D}"></span><span class="name">Democratic</span><span class="pct">${pct((d / t) * 100)}</span><span class="votes">${num(d)}</span></div>
-    <div class="cand"><span class="swatch" style="background:${PARTY.R}"></span><span class="name">Republican</span><span class="pct">${pct((r / t) * 100)}</span><span class="votes">${num(r)}</span></div>
-    <h3>Closest states</h3><div class="cards">${close
-      .map((c) => `<a class="card" href="${href({ state: c.postal })}"><div class="card-h"><b>${STATES[c.postal]?.name}</b></div><div class="line">${fmtMargin(c.m)}</div></a>`)
       .join('')}</div>`;
 }
 
 // ----- state view -----
 
-async function renderState(years: string[]) {
-  const { chamber, mode } = route;
+async function renderState() {
+  const { race, year } = route;
   const postal = route.state!;
   const st = STATES[postal];
-  const history = await getHistory(st.fips);
+  const regions = currentRegions();
   const stateShape = atlas.states.find((s) => s.id === st.fips);
   const counties = atlas.counties.filter((c) => c.id.startsWith(st.fips));
+  const outline = stateShape ? `<path class="borders state" d="${path(stateShape)}"/>` : '';
+  const panel = $('#panel');
 
-  $('#crumbs').innerHTML = `<a href="${href({ state: undefined })}">United States</a> › <b>${st.name}</b> · ${CHAMBER[chamber].label}`;
+  $('#crumbs').innerHTML = route.district
+    ? `<a href="${href({ state: undefined, district: undefined })}">United States</a> › <a href="${href({ district: undefined })}">${st.name}</a> › <b>${route.district.toUpperCase()}</b> · ${year} ${RACE_LABEL[race]}`
+    : `<a href="${href({ state: undefined })}">United States</a> › <b>${st.name}</b> · ${year} ${RACE_LABEL[race]}`;
   if (stateShape) {
     const [[x0, y0], [x1, y1]] = path.bounds(stateShape);
     const pad = Math.max(x1 - x0, y1 - y0) * 0.06;
     svg.setAttribute('viewBox', `${x0 - pad} ${y0 - pad} ${x1 - x0 + pad * 2} ${y1 - y0 + pad * 2}`);
   }
 
-  const region = chamber !== 'house' ? stateRegion(chamber, postal) : undefined;
-  const race = region?.election_id ? stateRaces.get(region.election_id) : undefined;
+  if (race === 'house') {
+    const forecast = isLive() ? await getForecast('house') : {};
+    const inState = (await loadDistricts(year)).filter((d) => d.state === postal);
+    const selected = route.district ? inState.find((d) => d.id === route.district) : undefined;
+    if (selected) {
+      await renderDistrict(selected, inState, regions, forecast, counties);
+      return;
+    }
+    drawShapes(inState.map((d) => districtShape(d, regions, forecast, href({ district: d.id }))), outline);
+    legend(isLive() ? FORECAST_NOTE : '');
+    panel.innerHTML = districtCards(regions, postal);
+    return;
+  }
 
-  // Match civicAPI's county breakdown to map shapes by FIPS, falling back to name.
+  if (race === 'president') {
+    await renderPresidentState(postal, regions, counties, outline);
+    return;
+  }
+
+  const races = stateRaceRegions(regions, postal);
+  if (!races.length) {
+    drawShapes(counties.map((shape) => ({ shape, fill: NO_RACE, cls: 'county' })), outline);
+    legend();
+    panel.innerHTML = `<h2>${st.name}</h2><p class="muted">No ${RACE_LABEL[race].toLowerCase()} race in ${st.name} in ${year}.</p>`;
+    return;
+  }
+
+  if (!isLive()) {
+    // Past Senate/Governor results are statewide only, so the whole state takes the result's colour.
+    const fill = raceFill(races[0][1]);
+    drawShapes(counties.map((shape) => ({ shape, fill, cls: 'county' })), outline);
+    legend('County results for past Senate and Governor races aren’t packaged yet.');
+    panel.innerHTML = races
+      .map(([, reg]) => `<h2>${esc(reg.name)}</h2><div class="meta"><span>${year} final</span></div>${candidateRows(reg.candidates)}`)
+      .join('');
+    return;
+  }
+
+  // Live: county results from the state's own civicAPI race.
+  const region = races[0][1];
+  const stateRace = region.election_id ? stateRaces.get(region.election_id) : undefined;
   const byFips = new Map<string, Region>();
-  if (race?.region_results) {
+  if (stateRace?.region_results) {
     const byName = new Map(counties.map((c) => [countyKey(c.properties.name), c.id]));
-    for (const reg of Object.values(race.region_results)) {
+    for (const reg of Object.values(stateRace.region_results)) {
       if (reg.type === 'State') continue;
       const fips = reg.fips && reg.fips.length === 5 ? reg.fips : byName.get(countyKey(reg.name));
       if (fips) byFips.set(fips, reg);
     }
   }
-  const latest = years[0];
-  const compareYear = mode !== 'live' && mode !== 'shift' ? mode : latest;
+  drawShapes(
+    counties.map((shape) => {
+      const reg = byFips.get(shape.id);
+      tips.set(
+        shape.id,
+        `<b>${esc(reg?.name ?? `${shape.properties.name} County`)}</b>` +
+          (reg ? `<div class="mini">${candidateRows(reg.candidates, 3)}</div><div class="muted">${pct(reg.percent_reporting)} reporting</div>` : ''),
+      );
+      return { shape, fill: (reg && liveFill(reg.candidates, false)) ?? NO_DATA, cls: 'county' };
+    }),
+    outline,
+  );
+  const regionCount = Object.values(stateRace?.region_results ?? {}).filter((r) => r.type !== 'State').length;
+  legend(stateRace && regionCount && byFips.size < regionCount / 2 ? 'This race reports by areas that don’t match county shapes.' : '');
 
-  const shapes = counties.map((shape) => {
-    const reg = byFips.get(shape.id);
-    const p = history[compareYear]?.[shape.id];
-    const pLatest = history[latest]?.[shape.id];
-    const live = reg ? liveMargin(reg.candidates) : null;
-    let fill = NO_DATA;
-    if (mode === 'live') fill = (reg && liveFill(reg.candidates, false)) ?? NO_DATA;
-    else if (mode === 'shift') fill = live != null && pLatest ? shiftFill(live - pastMargin(pLatest)) : NO_DATA;
-    else if (p) fill = marginFill(pastMargin(p));
-
-    const lines = [`<b>${esc(reg?.name ?? `${shape.properties.name} County`)}</b>`];
-    if (reg) lines.push(`<div class="mini">${candidateRows(reg.candidates, 3)}</div><div class="muted">${pct(reg.percent_reporting)} reporting</div>`);
-    for (const y of years) {
-      const py = history[y]?.[shape.id];
-      if (py) lines.push(`<div>${y} president: ${fmtMargin(pastMargin(py))} <span class="muted">(${num(py.t)} votes)</span></div>`);
-    }
-    if (live != null && pLatest) lines.push(`<div><b>Shift vs ${latest}: ${fmtMargin(live - pastMargin(pLatest))}</b></div>`);
-    tips.set(shape.id, lines.join(''));
-    return { shape, fill, cls: 'county' };
-  });
-  const outline = stateShape ? `<path class="borders state" d="${path(stateShape)}"/>` : '';
-  if (chamber === 'house' && mode === 'live') {
-    const forecast = await getForecast('house');
-    const inState = (await loadDistricts()).filter((d) => d.state === postal);
-    drawShapes(inState.map((d) => districtShape(d, forecast)), outline);
-    legend('live', 'Lighter shades before votes: forecast rating');
-    $('#panel').innerHTML = districtCards(postal);
-    return;
-  }
-  drawShapes(shapes, outline);
-
-  const matched = byFips.size;
-  const regionCount = Object.values(race?.region_results ?? {}).filter((r) => r.type !== 'State').length;
-  const note =
-    race && regionCount && matched < regionCount / 2
-      ? 'This race reports by areas that don’t match county shapes; see the table.'
-      : '';
-  legend(mode === 'shift' ? 'shift' : 'past', note);
-
-  const panel = $('#panel');
-  if (chamber === 'house') {
-    panel.innerHTML = districtCards(postal);
-    return;
-  }
-  if (!region) {
-    panel.innerHTML = `<h2>${st.name}</h2><p class="muted">No ${CHAMBER[chamber].label.toLowerCase()} race in ${st.name} this year.</p>${pastStatewide(history, years)}`;
-    return;
-  }
-  const forecast = (await getForecast(chamber))[postal];
-  const cands = race?.candidates ?? region.candidates;
+  const forecast = (await getForecast(race as Chamber))[postal];
   panel.innerHTML = `
-    <h2>${esc(race?.election_name ?? region.name)}</h2>
+    <h2>${esc(stateRace?.election_name ?? region.name)}</h2>
     <div class="meta">
-      <span>${pct(race?.percent_reporting ?? region.percent_reporting)} reporting</span>
+      <span>${pct(stateRace?.percent_reporting ?? region.percent_reporting)} reporting</span>
       ${forecast ? `<span class="chip">${esc(forecast.rating)}</span>` : ''}
-      ${race?.polls_close ? `<span class="muted">Polls close ${new Date(race.polls_close).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })}</span>` : ''}
+      ${stateRace?.polls_close ? `<span class="muted">Polls close ${new Date(stateRace.polls_close).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })}</span>` : ''}
     </div>
-    ${candidateRows(cands)}
-    ${pastStatewide(history, years)}
-    ${voteBanks(byFips, history, latest)}`;
+    ${candidateRows(stateRace?.candidates ?? region.candidates)}
+    ${races.slice(1).map(([, reg]) => `<h2 class="sub">${esc(reg.name)}</h2>${candidateRows(reg.candidates)}`).join('')}
+    ${liveVoteBanks(byFips)}`;
 }
 
-function pastStatewide(history: History, years: string[]): string {
-  const rows = years
-    .map((y) => {
-      const all = Object.values(history[y] ?? {});
-      if (!all.length) return '';
-      const d = all.reduce((s, p) => s + p.d, 0), r = all.reduce((s, p) => s + p.r, 0), t = all.reduce((s, p) => s + p.t, 0);
-      return `<tr><td>${y} president</td><td style="color:${d >= r ? PARTY.D : PARTY.R}">${fmtMargin((d - r) / t)}</td><td class="muted">${num(t)}</td></tr>`;
-    })
-    .join('');
-  return rows ? `<h3>Past results</h3><table class="tbl">${rows}</table>` : '';
+async function renderPresidentState(postal: string, regions: Record<string, Region>, counties: Shape[], outline: string) {
+  const year = String(route.year);
+  const history: History = await getHistory(STATES[postal].fips);
+  const results = history[year] ?? {};
+  drawShapes(
+    counties.map((shape) => {
+      const p = results[shape.id];
+      tips.set(
+        shape.id,
+        `<b>${esc(shape.properties.name)}</b>` +
+          (p ? `<div>${fmtMargin(pastMargin(p))}</div><div class="muted">${num(p.t)} votes</div>` : '<div class="muted">No county result in data</div>'),
+      );
+      return { shape, fill: p ? marginFill(pastMargin(p)) : NO_DATA, cls: 'county' };
+    }),
+    outline,
+  );
+  legend();
+
+  const statewide = regions[postal.toLowerCase()];
+  const districts = Object.entries(regions).filter(([k]) => k.startsWith(`${postal.toLowerCase()}-`));
+  const biggest = Object.entries(results)
+    .sort(([, a], [, b]) => b.t - a.t)
+    .slice(0, 12);
+  const countyName = (fips: string) => counties.find((c) => c.id === fips)?.properties.name ?? fips;
+  $('#panel').innerHTML = `
+    <h2>${STATES[postal].name}</h2>
+    <div class="meta"><span>${year} President</span><span class="chip">${evForState(postal)} EV</span></div>
+    ${statewide ? candidateRows(statewide.candidates) : '<p class="muted">No statewide result in data.</p>'}
+    ${districts.length ? `<h3>Districts (1 EV each)</h3>${districts.map(([k, reg]) => `<div class="district"><div class="card-h"><b>${k.toUpperCase()}</b></div>${candidateRows(reg.candidates, 2)}</div>`).join('')}` : ''}
+    ${biggest.length ? `<h3>Biggest counties</h3><table class="tbl"><tr class="muted"><td>County</td><td>Votes</td><td>Margin</td></tr>${biggest
+      .map(([f, p]) => `<tr><td>${esc(countyName(f))}</td><td class="muted">${num(p.t)}</td><td style="color:${p.d >= p.r ? PARTY.D : PARTY.R}">${fmtMargin(pastMargin(p))}</td></tr>`)
+      .join('')}</table>` : ''}`;
 }
 
-/** The biggest counties by vote, the Magic Wall "where are the votes still out" view. */
-function voteBanks(byFips: Map<string, Region>, history: History, latest: string): string {
-  const past = history[latest] ?? {};
-  const rows = [...byFips]
-    .map(([fips, reg]) => ({ fips, reg, size: past[fips]?.t ?? 0, live: liveMargin(reg.candidates) }))
-    .sort((a, b) => b.size - a.size)
+/** The biggest counties by votes counted so far: the Magic Wall "where are the votes" view. */
+function liveVoteBanks(byFips: Map<string, Region>): string {
+  const rows = [...byFips.values()]
+    .map((reg) => ({ reg, total: totalVotes(reg.candidates), m: liveMargin(reg.candidates) }))
+    .filter((r) => r.total > 0)
+    .sort((a, b) => b.total - a.total)
     .slice(0, 12);
   if (!rows.length) return '';
-  return `<h3>Biggest counties</h3>
-    <table class="tbl"><tr class="muted"><td>County</td><td>Rep.</td><td>Now</td><td>${latest}</td></tr>${rows
-      .map((r) => {
-        const p = past[r.fips];
-        return `<tr><td>${esc(r.reg.name.replace(/ County$/, ''))}</td><td class="muted">${Math.round(r.reg.percent_reporting)}%</td>
-          <td>${r.live == null ? '–' : `<span style="color:${r.live >= 0 ? PARTY.D : PARTY.R}">${fmtMargin(r.live)}</span>`}</td>
-          <td>${p ? `<span style="color:${p.d >= p.r ? PARTY.D : PARTY.R}">${fmtMargin(pastMargin(p))}</span>` : '–'}</td></tr>`;
-      })
+  return `<h3>Biggest counties so far</h3>
+    <table class="tbl"><tr class="muted"><td>County</td><td>Rep.</td><td>Votes</td><td>Margin</td></tr>${rows
+      .map((r) => `<tr><td>${esc(r.reg.name.replace(/ County$/, ''))}</td><td class="muted">${Math.round(r.reg.percent_reporting)}%</td>
+        <td class="muted">${num(r.total)}</td>
+        <td>${r.m == null ? '–' : `<span style="color:${r.m >= 0 ? PARTY.D : PARTY.R}">${fmtMargin(r.m)}</span>`}</td></tr>`)
       .join('')}</table>`;
 }
 
-function districtCards(postal: string): string {
-  const districts = houseDistricts(postal).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
-  if (!districts.length) return `<p class="muted">No House races found for ${STATES[postal].name}.</p>`;
+function districtCards(regions: Record<string, Region>, postal: string): string {
+  const districts = districtsIn(regions, postal);
+  if (!districts.length) return `<p class="muted">No House results for ${STATES[postal].name} in ${route.year}.</p>`;
   return `<h2>${STATES[postal].name} House</h2><div class="districts">${districts
-    .map(([k, reg]) => `<div class="district"><div class="card-h"><b>${k.toUpperCase()}</b><span class="muted">${pct(reg.percent_reporting)}</span></div>${candidateRows(reg.candidates, 3)}</div>`)
+    .map(([k, reg]) => `<a class="district" href="${href({ district: k })}"><div class="card-h"><b>${k.toUpperCase()}</b><span class="muted">${isLive() ? pct(reg.percent_reporting) : ''}</span></div>${candidateRows(reg.candidates, 3)}</a>`)
     .join('')}</div>`;
+}
+
+/**
+ * One House district: zoomed to its lines for the selected year. Live, its counties are
+ * coloured from the district race's county breakdown; past years show the district result.
+ * The panel adds the seat's results in every past year.
+ */
+async function renderDistrict(
+  district: District,
+  inState: District[],
+  regions: Record<string, Region>,
+  forecast: Record<string, Rating>,
+  counties: Shape[],
+) {
+  const [[x0, y0], [x1, y1]] = district.bounds;
+  const pad = Math.max(x1 - x0, y1 - y0) * 0.12;
+  svg.setAttribute('viewBox', `${x0 - pad} ${y0 - pad} ${x1 - x0 + pad * 2} ${y1 - y0 + pad * 2}`);
+
+  const region = regions[district.id];
+  const live = isLive();
+  const detail = live && region?.election_id ? stateRaces.get(region.election_id) : undefined;
+  // Neighbouring districts stay visible but faded, and link to their own pages.
+  const others = inState
+    .filter((d) => d !== district)
+    .map((d) => ({ ...districtShape(d, regions, forecast, href({ district: d.id })), cls: 'race district faded' }));
+  const outline = `<path class="borders state" d="${district.d}"/>`;
+
+  const byFips = new Map<string, Region>();
+  for (const reg of Object.values(detail?.region_results ?? {})) {
+    if (reg.fips?.length === 5) byFips.set(reg.fips, reg);
+  }
+  if (byFips.size) {
+    // County breakdown for the part of each county inside the district.
+    const clipId = 'district-clip';
+    const countyShapes = counties
+      .filter((c) => byFips.has(c.id))
+      .map((shape) => {
+        const reg = byFips.get(shape.id)!;
+        tips.set(shape.id, `<b>${esc(reg.name)}</b> <span class="muted">(part in ${district.id.toUpperCase()})</span>
+          <div class="mini">${candidateRows(reg.candidates, 3)}</div><div class="muted">${pct(reg.percent_reporting)} reporting</div>`);
+        return `<path d="${path(shape)}" fill="${liveFill(reg.candidates, false) ?? NO_DATA}" class="county" data-id="${shape.id}"/>`;
+      })
+      .join('');
+    drawShapes(
+      others,
+      `<path d="${district.d}" fill="${NO_DATA}" class="district"/>
+       <clipPath id="${clipId}"><path d="${district.d}"/></clipPath>
+       <g clip-path="url(#${clipId})">${countyShapes}</g>${outline}`,
+    );
+    legend('Counties are clipped to the district; results are for the part inside it.');
+  } else {
+    drawShapes([...others, districtShape(district, regions, forecast)], outline);
+    legend(live ? FORECAST_NOTE : '');
+  }
+
+  const rating = forecast[district.id.toUpperCase()];
+  const cands = detail?.candidates ?? region?.candidates;
+  $('#panel').innerHTML = `
+    <h2>${esc(district.id.toUpperCase())}</h2>
+    <div class="meta">
+      <span>${esc(district.name)}</span>
+      ${live && region ? `<span>${pct(detail?.percent_reporting ?? region.percent_reporting)} reporting</span>` : `<span>${route.year} final</span>`}
+      ${live && rating ? `<span class="chip">${esc(rating.rating)}</span>` : ''}
+    </div>
+    ${cands ? candidateRows(cands) : `<p class="muted">No result for this district in ${route.year}.</p>`}
+    ${live && byFips.size ? liveVoteBanks(byFips) : ''}
+    ${seatHistory(district.id)}`;
+}
+
+/** The same seat number in each past year. Lines may have been redrawn in between. */
+function seatHistory(key: string): string {
+  const rows = ALL_YEARS.filter((y) => y !== route.year && y !== LIVE_YEAR)
+    .map((y) => {
+      const reg = pastData.get(y)?.house?.[key];
+      if (!reg) return '';
+      const [a, b] = ranked(reg.candidates);
+      const m = topMargin(reg.candidates);
+      return `<tr>
+        <td><a href="${href({ year: y })}">${y}</a></td>
+        <td><span class="swatch-sm" style="background:${partyColor(a)}"></span>${esc(lastName(a.name))}${b ? ` <span class="muted">def. ${esc(lastName(b.name))}</span>` : ''}</td>
+        <td style="color:${partyColor(a)}">${m == null ? '–' : `+${(m * 100).toFixed(1)}`}</td></tr>`;
+    })
+    .join('');
+  return rows
+    ? `<h3>Past results for ${esc(key.toUpperCase())}</h3><table class="tbl">${rows}</table>
+       <p class="muted small">District lines can change between elections (2022 redistricting, plus some 2024 and 2026 redraws).</p>`
+    : '';
 }
 
 load();
