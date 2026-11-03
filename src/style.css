@@ -130,6 +130,7 @@ h2.sub { font-size: 16px; margin-top: 22px; }
 .district { display: block; text-decoration: none; background: var(--card); border: 1px solid transparent; border-radius: 8px; padding: 8px 10px; }
 a.district:hover { border-color: var(--accent); }
 #map .faded { opacity: 0.35; }
+#map path.county.selected { stroke: #fff; stroke-width: 2.5; }
 #map .faded:hover { opacity: 0.7; }
 .swatch-sm { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
 .tbl a { color: var(--accent); }

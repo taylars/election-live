@@ -12,8 +12,9 @@ It's a static site (Vite + TypeScript + d3-geo) that runs on GitHub Pages. For 2
   - 2026: secured seats (called races plus seats not up), and a projection that adds each uncalled race as *likely*, *lean* or *toss-up*. Before a race reaches 15% reporting its tier comes from civicAPI's forecast rating (Safe/Likely → likely, Lean/Tilt → lean); after that it comes from the live margin weighed against the share of the vote still out (`src/projection.ts`). Race cards show each race's current tier; a • marks tiers based on live results.
   - Past Senate/Governor: the chamber as seated the following January, plus seats won that year. Past House: seats won.
 - **State**: counties coloured by the race (live 2026 county results, or past presidential county results). Past Senate and Governor results are statewide only.
+- **County** (President, Senate, Governor): click a county on a state's map. Shows the selected race in that county (live 2026 county results, or past presidential county results) and the county's past presidential results.
 - **District** (House): click a district on a state's map, or its card. Live, its counties are coloured from the district's county breakdown; the panel also lists the seat's results in 2020–2024.
-- URLs are shareable, e.g. `#/senate/2024/ga` or `#/house/2026/mi/07`.
+- URLs are shareable, e.g. `#/senate/2024/ga`, `#/house/2026/mi/07` or `#/senate/2026/ga/county/13121`.
 - Add `?testdata` to the URL (e.g. `/?testdata#/senate/2026`) to have civicAPI fill the races with simulated votes, for rehearsing before polls close.
 
 ### Live updates and caching

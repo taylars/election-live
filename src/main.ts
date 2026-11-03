@@ -2,7 +2,7 @@ import './style.css';
 import { geoPath } from 'd3-geo';
 import {
   CACHE_TTL_MS, CHAMBER, NATIONAL_RACE, TEST_DATA, getForecast, getHistory, getPast, getRace, partyLabel, side,
-  type Candidate, type Chamber, type History, type PastYear, type Race, type Rating, type Region, type Side,
+  type Candidate, type Chamber, type History, type PastResult, type PastYear, type Race, type Rating, type Region, type Side,
 } from './api';
 import {
   LEVEL_FILL, NO_DATA, NO_RACE, PARTY, TOSSUP, finalFill, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
@@ -20,6 +20,7 @@ interface Route {
   year: number;
   state?: string; // postal code, upper case
   district?: string; // House only, e.g. "mi-07"
+  county?: string; // county FIPS, other races only, e.g. "13121"
 }
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -70,27 +71,33 @@ let tips = new Map<string, string>();
 // ---------- routing ----------
 
 /**
- * Routes look like #/senate/2024/ga: race, year, then an optional state, and for
- * the House an optional district (#/house/2024/mi/07).
+ * Routes look like #/senate/2024/ga: race, year, then an optional state. Below a state,
+ * the House can open a district (#/house/2024/mi/07) and the other races a county
+ * (#/senate/2026/ga/county/13121).
  */
 function parseRoute(): Route {
-  const [r, y, s, d] = location.hash.replace(/^#\/?/, '').split('?')[0].split('/');
+  const [r, y, s, d, e] = location.hash.replace(/^#\/?/, '').split('?')[0].split('/');
   const race: RaceKind = r in RACE_LABEL ? (r as RaceKind) : 'senate';
   const year = YEARS[race].includes(Number(y)) ? Number(y) : YEARS[race][0];
   const state = s && STATES[s.toUpperCase()] ? s.toUpperCase() : undefined;
   const district = race === 'house' && state && /^(\d{2}|al)$/.test(d ?? '') ? `${state.toLowerCase()}-${d}` : undefined;
-  return { race, year, state, district };
+  const county = race !== 'house' && state && d === 'county' && e?.length === 5 && e.startsWith(STATES[state].fips) ? e : undefined;
+  return { race, year, state, district, county };
 }
 
 function href(r: Partial<Route>): string {
   const next = { ...route, ...r };
   // Keep the year when switching race if that race has one; otherwise its latest.
   const year = YEARS[next.race].includes(next.year) ? next.year : YEARS[next.race][0];
-  // A district only makes sense in the House view of its own state.
-  const district = next.race === 'house' && next.state && next.district?.startsWith(`${next.state.toLowerCase()}-`)
-    ? `/${next.district.split('-')[1]}`
-    : '';
-  return `#/${next.race}/${year}${next.state ? `/${next.state.toLowerCase()}` : ''}${district}`;
+  const st = next.state ? STATES[next.state] : undefined;
+  // A district only makes sense in the House view of its own state, a county in the others.
+  let below = '';
+  if (next.race === 'house' && next.state && next.district?.startsWith(`${next.state.toLowerCase()}-`)) {
+    below = `/${next.district.split('-')[1]}`;
+  } else if (next.race !== 'house' && st && next.county?.startsWith(st.fips)) {
+    below = `/county/${next.county}`;
+  }
+  return `#/${next.race}/${year}${next.state ? `/${next.state.toLowerCase()}` : ''}${below}`;
 }
 
 window.addEventListener('hashchange', () => {
@@ -159,7 +166,8 @@ async function load() {
       if (!pastData.has(y)) tasks.push(getPast(y).then((p) => pastData.set(y, p)));
     }
     if (race === 'house') tasks.push(loadDistricts(year));
-    if (race === 'president' && state) tasks.push(getHistory(STATES[state].fips));
+    // County presidential results back the President map and every county page.
+    if (state && (race === 'president' || route.county)) tasks.push(getHistory(STATES[state].fips));
     await Promise.all(tasks);
     error = '';
   } catch (e) {
@@ -307,8 +315,10 @@ interface Drawn {
 
 /** Draws atlas shapes, or pre-projected districts, with optional overlay markup on top. */
 function drawShapes(shapes: (Drawn & ({ shape: Shape } | { district: District }))[], extra = '') {
+  // Draw a selected shape last so its outline sits on top of its neighbours.
+  const ordered = [...shapes].sort((a, b) => Number(!!a.cls?.includes('selected')) - Number(!!b.cls?.includes('selected')));
   svg.innerHTML =
-    shapes
+    ordered
       .map((s) => {
         const [id, d] = 'shape' in s ? [s.shape.id, path(s.shape)] : [s.district.id, s.district.d];
         const el = `<path d="${d}" fill="${s.fill}" class="${s.cls ?? ''}" data-id="${id}"/>`;
@@ -667,12 +677,20 @@ async function renderState() {
   const outline = stateShape ? `<path class="borders state" d="${path(stateShape)}"/>` : '';
   const panel = $('#panel');
 
-  $('#crumbs').innerHTML = route.district
-    ? `<a href="${href({ state: undefined, district: undefined })}">United States</a> › <a href="${href({ district: undefined })}">${st.name}</a> › <b>${route.district.toUpperCase()}</b> · ${year} ${RACE_LABEL[race]}`
-    : `<a href="${href({ state: undefined })}">United States</a> › <b>${st.name}</b> · ${year} ${RACE_LABEL[race]}`;
-  if (stateShape) {
-    const [[x0, y0], [x1, y1]] = path.bounds(stateShape);
-    const pad = Math.max(x1 - x0, y1 - y0) * 0.06;
+  const selectedCounty = route.county ? counties.find((c) => c.id === route.county) : undefined;
+  const top = `<a href="${href({ state: undefined, district: undefined, county: undefined })}">United States</a> › `;
+  const stateLink = `<a href="${href({ district: undefined, county: undefined })}">${st.name}</a>`;
+  const leaf = route.district
+    ? `${stateLink} › <b>${route.district.toUpperCase()}</b>`
+    : selectedCounty
+      ? `${stateLink} › <b>${esc(countyLabel(selectedCounty, postal))}</b>`
+      : `<b>${st.name}</b>`;
+  $('#crumbs').innerHTML = `${top}${leaf} · ${year} ${RACE_LABEL[race]}`;
+  const focus = selectedCounty ?? stateShape;
+  if (focus) {
+    const [[x0, y0], [x1, y1]] = path.bounds(focus);
+    // A county gets a wide margin so its neighbours show for context.
+    const pad = Math.max(x1 - x0, y1 - y0) * (selectedCounty ? 0.9 : 0.06);
     svg.setAttribute('viewBox', `${x0 - pad} ${y0 - pad} ${x1 - x0 + pad * 2} ${y1 - y0 + pad * 2}`);
   }
 
@@ -697,20 +715,25 @@ async function renderState() {
 
   const races = stateRaceRegions(regions, postal);
   if (!races.length) {
-    drawShapes(counties.map((shape) => ({ shape, fill: NO_RACE, cls: 'county' })), outline);
+    drawShapes(counties.map((shape) => countyItem(shape, NO_RACE)), outline);
     legend();
-    panel.innerHTML = `<h2>${st.name}</h2><p class="muted">No ${RACE_LABEL[race].toLowerCase()} race in ${st.name} in ${year}.</p>`;
+    const none = `<p class="muted">No ${RACE_LABEL[race].toLowerCase()} race in ${st.name} in ${year}.</p>`;
+    panel.innerHTML = selectedCounty ? await countyPanel(postal, selectedCounty, none) : `<h2>${st.name}</h2>${none}`;
     return;
   }
 
   if (!isLive()) {
     // Past Senate/Governor results are statewide only, so the whole state takes the result's colour.
     const fill = raceFill(races[0][1]);
-    drawShapes(counties.map((shape) => ({ shape, fill, cls: 'county' })), outline);
+    drawShapes(counties.map((shape) => countyItem(shape, fill)), outline);
     legend('County results for past Senate and Governor races aren’t packaged yet.');
-    panel.innerHTML = races
-      .map(([, reg]) => `<h2>${esc(reg.name)}</h2><div class="meta"><span>${year} final</span></div>${candidateRows(reg.candidates)}`)
-      .join('');
+    panel.innerHTML = selectedCounty
+      ? await countyPanel(postal, selectedCounty, `<p class="muted">County results for past ${RACE_LABEL[race]} races aren’t packaged yet. Statewide:</p>${races
+          .map(([, reg]) => `<h3>${esc(reg.name)}</h3>${candidateRows(reg.candidates, 3)}`)
+          .join('')}`)
+      : races
+          .map(([, reg]) => `<h2>${esc(reg.name)}</h2><div class="meta"><span>${year} final</span></div>${candidateRows(reg.candidates)}`)
+          .join('');
     return;
   }
 
@@ -734,13 +757,24 @@ async function renderState() {
         `<b>${esc(reg?.name ?? `${shape.properties.name} County`)}</b>` +
           (reg ? `<div class="mini">${candidateRows(reg.candidates, 3)}</div><div class="muted">${pct(reg.percent_reporting)} reporting</div>` : ''),
       );
-      return { shape, fill: (reg && liveFill(reg.candidates, false)) ?? NO_DATA, cls: 'county' };
+      return countyItem(shape, (reg && liveFill(reg.candidates, false)) ?? NO_DATA);
     }),
     outline,
   );
   const regionCount = Object.values(stateRace?.region_results ?? {}).filter((r) => r.type !== 'State').length;
   legend(stateRace && regionCount && byFips.size < regionCount / 2 ? 'This race reports by areas that don’t match county shapes.' : '');
 
+  if (selectedCounty) {
+    const reg = byFips.get(selectedCounty.id);
+    panel.innerHTML = await countyPanel(
+      postal,
+      selectedCounty,
+      reg
+        ? `<div class="meta"><span>${pct(reg.percent_reporting)} reporting</span></div>${candidateRows(reg.candidates)}`
+        : `<p class="muted">No county results yet.</p>`,
+    );
+    return;
+  }
   const forecast = (await getForecast(race as Chamber))[postal];
   panel.innerHTML = `
     <h2>${esc(stateRace?.election_name ?? region.name)}</h2>
@@ -766,13 +800,24 @@ async function renderPresidentState(postal: string, regions: Record<string, Regi
         `<b>${esc(shape.properties.name)}</b>` +
           (p ? `<div>${fmtMargin(pastMargin(p))}</div><div class="muted">${num(p.t)} votes</div>` : '<div class="muted">No county result in data</div>'),
       );
-      return { shape, fill: p ? marginFill(pastMargin(p)) : NO_DATA, cls: 'county' };
+      return countyItem(shape, p ? marginFill(pastMargin(p)) : NO_DATA);
     }),
     outline,
   );
   legend();
 
   const statewide = regions[postal.toLowerCase()];
+  const county = route.county ? counties.find((c) => c.id === route.county) : undefined;
+  if (county) {
+    const p = results[county.id];
+    $('#panel').innerHTML = await countyPanel(
+      postal,
+      county,
+      p && statewide ? candidateRows(countyCandidates(p, statewide.candidates)) : '<p class="muted">No county result in data.</p>',
+    );
+    return;
+  }
+
   const districts = Object.entries(regions).filter(([k]) => k.startsWith(`${postal.toLowerCase()}-`));
   const biggest = Object.entries(results)
     .sort(([, a], [, b]) => b.t - a.t)
@@ -786,6 +831,68 @@ async function renderPresidentState(postal: string, regions: Record<string, Regi
     ${biggest.length ? `<h3>Biggest counties</h3><table class="tbl"><tr class="muted"><td>County</td><td>Votes</td><td>Margin</td></tr>${biggest
       .map(([f, p]) => `<tr><td>${esc(countyName(f))}</td><td class="muted">${num(p.t)}</td><td style="color:${p.d >= p.r ? PARTY.D : PARTY.R}">${fmtMargin(pastMargin(p))}</td></tr>`)
       .join('')}</table>` : ''}`;
+}
+
+function countyLabel(shape: Shape, postal: string): string {
+  const name = shape.properties.name;
+  if (postal === 'LA') return `${name} Parish`;
+  if (postal === 'AK' || /\b(city|borough|area|municipality)$/i.test(name)) return name;
+  return `${name} County`;
+}
+
+/** A county on a state map: clickable, and faded around the selected county. */
+function countyItem(shape: Shape, fill: string) {
+  const state = route.county ? (shape.id === route.county ? ' selected' : ' faded') : '';
+  return { shape, fill, cls: `county${state}`, link: href({ county: shape.id }) };
+}
+
+/**
+ * Turns a county's packaged presidential totals into candidate rows, borrowing the
+ * names from the statewide result. Third parties are lumped together as "Other".
+ */
+function countyCandidates(p: PastResult, statewide: Candidate[]): Candidate[] {
+  const named = (s: Side) => statewide.find((c) => side(c.party) === s);
+  const row = (s: 'D' | 'R', votes: number, won: boolean): Candidate => ({
+    name: named(s)?.name ?? (s === 'D' ? 'Democrat' : 'Republican'),
+    party: s === 'D' ? 'Democrat' : 'Republican',
+    color: '',
+    votes,
+    percent: (votes / p.t) * 100,
+    winner: won,
+  });
+  const other = p.t - p.d - p.r;
+  return [
+    row('D', p.d, p.d > p.r),
+    row('R', p.r, p.r > p.d),
+    ...(other > 0 ? [{ name: 'Other', party: 'Other', color: '#808080', votes: other, percent: (other / p.t) * 100, winner: false }] : []),
+  ];
+}
+
+/** A county's page: the selected race there, then its past presidential results. */
+async function countyPanel(postal: string, shape: Shape, current: string): Promise<string> {
+  const history = await getHistory(STATES[postal].fips);
+  const years = Object.keys(history)
+    .filter((y) => history[y][shape.id] && !(route.race === 'president' && Number(y) === route.year))
+    .sort()
+    .reverse();
+  const rows = years
+    .map((y) => {
+      const p = history[y][shape.id];
+      const m = pastMargin(p);
+      return `<tr>
+        <td><a href="${href({ race: 'president', year: Number(y) })}">${y}</a></td>
+        <td style="color:${PARTY.D}">${pct((p.d / p.t) * 100)}</td>
+        <td style="color:${PARTY.R}">${pct((p.r / p.t) * 100)}</td>
+        <td style="color:${m >= 0 ? PARTY.D : PARTY.R}">${fmtMargin(m)}</td>
+        <td class="muted">${num(p.t)}</td></tr>`;
+    })
+    .join('');
+  return `
+    <h2>${esc(countyLabel(shape, postal))}</h2>
+    <div class="meta"><span>${STATES[postal].name}</span><span>${route.year} ${RACE_LABEL[route.race]}</span></div>
+    ${current}
+    ${rows ? `<h3>Past presidential results</h3>
+      <table class="tbl"><tr class="muted"><td>Year</td><td>D</td><td>R</td><td>Margin</td><td>Votes</td></tr>${rows}</table>` : ''}`;
 }
 
 /** The biggest counties by votes counted so far: the Magic Wall "where are the votes" view. */
