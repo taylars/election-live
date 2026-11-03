@@ -1,7 +1,7 @@
 import './style.css';
 import { geoPath } from 'd3-geo';
 import {
-  CACHE_TTL_MS, CHAMBER, NATIONAL_RACE, TEST_DATA, getCountyResults, getForecast, getHistory, getPast, getRace, partyLabel, side,
+  CHAMBER, NATIONAL_RACE, POLL_MS, TEST_DATA, getCountyResults, getForecast, getHistory, getPast, getRace, partyLabel, side,
   type Candidate, type Chamber, type History, type PastResult, type PastYear, type Race, type Rating, type Region, type Side,
 } from './api';
 import {
@@ -63,6 +63,8 @@ const pastData = new Map<number, PastYear>();
 let atlas: Atlas;
 let route: Route = parseRoute();
 let lastFetch = 0;
+/** When the poll last ran (or the page loaded): it runs every POLL_MS from here, whatever the data's age. */
+let lastPoll = Date.now();
 let error = '';
 let polling = readPolling();
 /** Tooltip HTML for the shape under the cursor, keyed by shape id. */
@@ -194,7 +196,9 @@ function setPolling(on: boolean) {
   }
 }
 
+/** Fetches the current view from civicAPI, skipping and updating the cache, and restarts the poll timer. */
 async function refresh() {
+  lastPoll = Date.now();
   try {
     await fetchCurrent(true);
     error = '';
@@ -206,7 +210,7 @@ async function refresh() {
 
 let refreshing = false;
 setInterval(async () => {
-  const due = isLive() && polling && !refreshing && document.visibilityState === 'visible' && Date.now() - lastFetch >= CACHE_TTL_MS;
+  const due = isLive() && polling && !refreshing && document.visibilityState === 'visible' && Date.now() - lastPoll >= POLL_MS;
   if (due) {
     refreshing = true;
     await refresh();
@@ -300,7 +304,7 @@ function renderStatus() {
     text.textContent = 'Loading…';
   } else {
     const t = new Date(lastFetch).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-    const left = Math.max(0, Math.ceil((CACHE_TTL_MS - (Date.now() - lastFetch)) / 1000));
+    const left = Math.max(0, Math.ceil((POLL_MS - (Date.now() - lastPoll)) / 1000));
     const next = left >= 60 ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}` : `${left}s`;
     text.innerHTML = polling
       ? `<span class="live"></span>Updated ${t} · next in ${next}`

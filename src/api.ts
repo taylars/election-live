@@ -51,8 +51,13 @@ export const CHAMBER: Record<Chamber, { label: string; total: number; majority?:
 /** Add ?testdata to the page URL to have civicAPI fill races with simulated votes. */
 export const TEST_DATA = new URLSearchParams(location.search).has('testdata');
 
-/** How long a civicAPI response is reused before it's fetched again (also the poll interval). */
-export const CACHE_TTL_MS = 5 * 60_000;
+/**
+ * How long a civicAPI response is reused for page loads and view switches. Fresh data
+ * comes from the poll and the Refresh button, which skip the cache and update it.
+ */
+export const CACHE_TTL_MS = 60 * 60_000;
+/** How often the current view is refreshed from civicAPI. */
+export const POLL_MS = 5 * 60_000;
 const CACHE_PREFIX = 'civicapi:';
 
 export interface Fetched<T> {

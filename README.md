@@ -20,7 +20,7 @@ It's a static site (Vite + TypeScript + d3-geo) that runs on GitHub Pages. For 2
 
 ### Live updates and caching
 
-civicAPI responses are cached in localStorage for 5 minutes, so reloading or switching views doesn't hit the API again. Auto-refresh polls every 5 minutes. The poll and the **Refresh** button skip the cache. Auto-refresh can be switched off; the choice is remembered per browser.
+civicAPI responses are cached in localStorage for an hour, so reloading the page or switching tabs, states or years reuses them instead of calling the API. Auto-refresh polls the current view every 5 minutes (counted from page load or the last refresh), and the poll and the **Refresh** button skip the cache and update it. Auto-refresh can be switched off; the choice is remembered per browser.
 
 ## Data
 
