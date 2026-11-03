@@ -5,7 +5,7 @@ import {
   type Candidate, type Chamber, type History, type PastYear, type Race, type Rating, type Region, type Side,
 } from './api';
 import {
-  LEVEL_FILL, NO_DATA, NO_RACE, PARTY, TOSSUP, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
+  LEVEL_FILL, NO_DATA, NO_RACE, PARTY, TOSSUP, finalFill, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
   pastMargin, ranked, ratingFill,
 } from './colors';
 import { ALL_YEARS, LIVE_YEAR, RACE_LABEL, SEATED, YEARS, electoralVotes, type RaceKind } from './elections';
@@ -240,7 +240,7 @@ function topMargin(cands: Candidate[]): number | null {
 function raceFill(region: Region | undefined, rating?: string): string {
   if (!region) return NO_DATA;
   if (isLive()) return liveFill(region.candidates) ?? ratingFill(rating) ?? NO_DATA;
-  return liveFill(region.candidates, false) ?? NO_DATA;
+  return finalFill(region.candidates) ?? NO_DATA;
 }
 
 async function render() {

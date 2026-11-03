@@ -55,8 +55,22 @@ export function pastMargin(p: PastResult): number {
   return (p.d - p.r) / p.t;
 }
 
+/** Past results: a narrow win is a light shade of the winner's colour, a landslide (40+) is solid. */
+function finalShade(color: string, margin: number): string {
+  return lighten(color, 0.7 * (1 - Math.min(1, Math.abs(margin) / 0.4)));
+}
+
+/** Colour for a D-minus-R margin (positive = Democratic win) in a past result. */
 export function marginFill(m: number): string {
-  return tint(m >= 0 ? PARTY.D : PARTY.R, 0.25 + 0.75 * Math.min(1, Math.abs(m) / 0.4));
+  return finalShade(m >= 0 ? PARTY.D : PARTY.R, m);
+}
+
+/** Colour for a finished race: the winner's colour, lighter the closer it was. */
+export function finalFill(cands: Candidate[]): string | null {
+  const [a, b] = ranked(cands);
+  const total = cands.reduce((s, c) => s + c.votes, 0);
+  if (!a || total === 0) return null;
+  return finalShade(partyColor(a), (a.votes - (b?.votes ?? 0)) / total);
 }
 
 export const TOSSUP = '#e3c25b';
