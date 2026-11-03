@@ -10,7 +10,7 @@
     "history": "node scripts/build-history.mjs",
     "districts": "node scripts/build-districts.mjs",
     "past": "node scripts/build-past.mjs",
-    "senate-counties": "node scripts/build-senate-counties.mjs"
+    "counties": "node scripts/build-counties.mjs"
   },
   "dependencies": {
     "d3-geo": "^3.1.2",
