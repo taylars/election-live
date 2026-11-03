@@ -181,9 +181,9 @@ async function load() {
 
 function readPolling(): boolean {
   try {
-    return localStorage.getItem('polling') !== 'off';
+    return localStorage.getItem('polling') === 'on';
   } catch {
-    return true;
+    return false;
   }
 }
 
