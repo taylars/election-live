@@ -70,7 +70,8 @@ h2.sub { font-size: 16px; margin-top: 22px; }
 #map .borders { fill: none; stroke: #6b7486; stroke-width: 1; pointer-events: none; }
 #map .borders.state { stroke: #c9d0dc; stroke-width: 1.5; }
 
-.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); padding-top: 8px; }
+.legend { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); padding-top: 8px; }
+.legend-row { display: flex; flex-wrap: wrap; gap: 6px 16px; }
 .legend span { display: flex; align-items: center; gap: 6px; }
 .legend i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
 

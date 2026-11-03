@@ -370,17 +370,23 @@ const sample = (lead: string, trail: string) => [
   { party: trail, votes: 48, color: '', name: '', percent: 0, winner: false },
 ];
 
-function legend(note = '') {
+function legend(note = '', showForecast = false) {
   const items = isLive()
     ? [[PARTY.D, 'D called'], [liveFill(sample('Democrat', 'Republican'))!, 'D leading'],
        [liveFill(sample('Republican', 'Democrat'))!, 'R leading'], [PARTY.R, 'R called'], [NO_DATA, 'No votes yet']]
     : [[marginFill(0.4), 'D +40'], [marginFill(0.05), 'D +5'], [marginFill(-0.05), 'R +5'], [marginFill(-0.4), 'R +40']];
+  const swatches = (list: string[][]) => list.map(([c, l]) => `<span><i style="background:${c}"></i>${l}</span>`).join('');
+  // Before votes, races are shaded by forecast rating in the seat bar's tier colours.
+  const forecast = showForecast
+    ? `<div class="legend-row"><span class="muted">Before votes:</span>${swatches([
+        [ratingFill('Likely D')!, 'Likely D'], [ratingFill('Lean D')!, 'Lean D'], [ratingFill('Tossup')!, 'Toss-up'],
+        [ratingFill('Lean R')!, 'Lean R'], [ratingFill('Likely R')!, 'Likely R'],
+      ])}</div>`
+    : '';
   $('#legend').innerHTML =
-    items.map(([c, l]) => `<span><i style="background:${c}"></i>${l}</span>`).join('') +
-    (note ? `<span class="muted">${note}</span>` : '');
+    `<div class="legend-row">${swatches(items)}</div>${forecast}` +
+    (note ? `<div class="legend-row muted">${note}</div>` : '');
 }
-
-const FORECAST_NOTE = 'Lighter shades before votes: forecast rating';
 
 // ----- national view -----
 
@@ -398,7 +404,7 @@ async function renderNation() {
       districts.map((d) => districtShape(d, regions, forecast, href({ state: d.state }))),
       `<path class="borders" d="${path(atlas.stateBorders)}"/><path class="borders" d="${path(atlas.nation as never)}"/>`,
     );
-    legend(isLive() ? FORECAST_NOTE : '');
+    legend('', isLive());
     const national = nationalRaces.get('house');
     if (isLive() && !national) panel.innerHTML = `<p class="muted">Loading results…</p>`;
     else panel.innerHTML = (isLive() ? balance(national!, forecast) : houseTally(regions)) + houseList(regions);
@@ -427,7 +433,7 @@ async function renderNation() {
     return { shape, fill: raceFill(races[0][1], rating), cls: 'race', link: href({ state: postal }) };
   });
   drawShapes(shapes, `<path class="borders" d="${path(atlas.nation as never)}"/>`);
-  legend(usedForecast ? FORECAST_NOTE : '');
+  legend('', usedForecast);
 
   if (isLive() && !nationalRaces.get(race as Chamber)) {
     panel.innerHTML = `<p class="muted">Loading results…</p>`;
@@ -679,7 +685,7 @@ async function renderState() {
       return;
     }
     drawShapes(inState.map((d) => districtShape(d, regions, forecast, href({ district: d.id }))), outline);
-    legend(isLive() ? FORECAST_NOTE : '');
+    legend('', isLive());
     panel.innerHTML = districtCards(regions, postal);
     return;
   }
@@ -856,7 +862,7 @@ async function renderDistrict(
     legend('Counties are clipped to the district; results are for the part inside it.');
   } else {
     drawShapes([...others, districtShape(district, regions, forecast)], outline);
-    legend(live ? FORECAST_NOTE : '');
+    legend('', live);
   }
 
   const rating = forecast[district.id.toUpperCase()];

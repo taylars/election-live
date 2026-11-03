@@ -73,15 +73,17 @@ export const LEVEL_FILL: Record<'secured' | 'likely' | 'lean', (s: Side) => stri
   lean: (s) => lighten(PARTY[s], 0.65),
 };
 
-const RATING_STRENGTH: Record<string, number> = { Safe: 0.55, Likely: 0.42, Lean: 0.3, Tilt: 0.2 };
-
-/** Pre-results colouring from a forecast rating like "Lean R" or "Toss-up". */
+/**
+ * Pre-results colouring from a forecast rating like "Lean R" or "Tossup", using the
+ * seat bar's tier colours: Safe/Likely → likely, Lean/Tilt → lean (as in projection.ts).
+ */
 export function ratingFill(rating: string | undefined): string | null {
   if (!rating) return null;
   const [level, who] = rating.split(' ');
-  const strength = RATING_STRENGTH[level];
-  if (!strength || (who !== 'D' && who !== 'R')) return TOSSUP;
-  return tint(PARTY[who], strength);
+  if (who !== 'D' && who !== 'R') return TOSSUP;
+  if (level === 'Safe' || level === 'Likely') return LEVEL_FILL.likely(who);
+  if (level === 'Lean' || level === 'Tilt') return LEVEL_FILL.lean(who);
+  return TOSSUP;
 }
 
 export function fmtMargin(m: number): string {
