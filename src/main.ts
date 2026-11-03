@@ -29,7 +29,11 @@ app.innerHTML = `
     <div class="brand"><span class="dot"></span> Election Live <small>Nov 3, 2026</small>${TEST_DATA ? '<span class="chip flip">SIMULATED DATA</span>' : ''}</div>
     <nav class="tabs" id="tabs"></nav>
     <nav class="modes" id="modes"></nav>
-    <div class="status" id="status"></div>
+    <div class="status" id="status">
+      <span id="status-text"></span>
+      <button data-action="refresh" title="Refresh now">↻ Refresh</button>
+      <button data-action="toggle" class="toggle" role="switch" aria-checked="true"><span class="knob"></span>Auto-refresh</button>
+    </div>
   </header>
   <main class="wall">
     <section class="map-wrap">
@@ -57,6 +61,7 @@ let atlas: Atlas;
 let route: Route = parseRoute();
 let lastFetch = 0;
 let error = '';
+let polling = readPolling();
 /** Tooltip HTML for the shape under the cursor, keyed by shape id. */
 let tips = new Map<string, string>();
 
@@ -122,20 +127,56 @@ async function load() {
   await render();
 }
 
+function readPolling(): boolean {
+  try {
+    return localStorage.getItem('polling') !== 'off';
+  } catch {
+    return true;
+  }
+}
+
+function setPolling(on: boolean) {
+  polling = on;
+  try {
+    localStorage.setItem('polling', on ? 'on' : 'off');
+  } catch {
+    // Storage unavailable (private mode etc.); the toggle still works for this visit.
+  }
+}
+
+async function refresh() {
+  try {
+    await fetchCurrent();
+    error = '';
+  } catch (e) {
+    error = e instanceof Error ? e.message : String(e);
+  }
+  render();
+}
+
+let refreshing = false;
 setInterval(async () => {
-  if (document.visibilityState !== 'visible') return;
-  if (Date.now() - lastFetch >= REFRESH_MS) {
-    try {
-      await fetchCurrent();
-      error = '';
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    }
-    render();
+  if (polling && !refreshing && document.visibilityState === 'visible' && Date.now() - lastFetch >= REFRESH_MS) {
+    refreshing = true;
+    await refresh();
+    refreshing = false;
   } else {
     renderStatus();
   }
 }, 1000);
+
+$('#status').addEventListener('click', async (e) => {
+  const action = (e.target as Element).closest('button')?.dataset.action;
+  if (action === 'toggle') {
+    setPolling(!polling);
+    renderStatus();
+  } else if (action === 'refresh' && !refreshing) {
+    refreshing = true;
+    renderStatus();
+    await refresh();
+    refreshing = false;
+  }
+});
 
 // ---------- rendering ----------
 
@@ -176,18 +217,25 @@ function renderModes(years: string[]) {
 }
 
 function renderStatus() {
-  const el = $('#status');
+  const text = $('#status-text');
+  const refreshBtn = $<HTMLButtonElement>('#status [data-action="refresh"]');
+  const toggle = $('#status [data-action="toggle"]');
+  refreshBtn.disabled = refreshing;
+  refreshBtn.textContent = refreshing ? 'Refreshing…' : '↻ Refresh';
+  toggle.classList.toggle('on', polling);
+  toggle.setAttribute('aria-checked', String(polling));
+
   if (error) {
-    el.innerHTML = `<span class="err" title="${esc(error)}">⚠ Couldn't reach civicAPI, retrying</span>`;
-    return;
+    text.innerHTML = `<span class="err" title="${esc(error)}">⚠ Couldn't reach civicAPI${polling ? ', retrying' : ''}</span>`;
+  } else if (!lastFetch) {
+    text.textContent = 'Loading…';
+  } else {
+    const t = new Date(lastFetch).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    const next = Math.max(0, Math.ceil((REFRESH_MS - (Date.now() - lastFetch)) / 1000));
+    text.innerHTML = polling
+      ? `<span class="live"></span>Updated ${t} · next in ${next}s`
+      : `<span class="live paused"></span>Updated ${t} · paused`;
   }
-  if (!lastFetch) {
-    el.textContent = 'Loading…';
-    return;
-  }
-  const next = Math.max(0, Math.ceil((REFRESH_MS - (Date.now() - lastFetch)) / 1000));
-  const t = new Date(lastFetch).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-  el.innerHTML = `<span class="live"></span>Updated ${t} · refresh in ${next}s`;
 }
 
 function drawShapes(shapes: { shape: Shape; fill: string; cls?: string; link?: string }[], extra = '') {
