@@ -1,7 +1,7 @@
 import './style.css';
 import { geoPath } from 'd3-geo';
 import {
-  CACHE_TTL_MS, CHAMBER, NATIONAL_RACE, TEST_DATA, getForecast, getHistory, getPast, getRace, partyLabel, side,
+  CACHE_TTL_MS, CHAMBER, NATIONAL_RACE, TEST_DATA, getCountyResults, getForecast, getHistory, getPast, getRace, partyLabel, side,
   type Candidate, type Chamber, type History, type PastResult, type PastYear, type Race, type Rating, type Region, type Side,
 } from './api';
 import {
@@ -138,9 +138,8 @@ async function fetchCurrent(force = false) {
   const national = await getRace(NATIONAL_RACE[chamber], force);
   nationalRaces.set(chamber, national.data);
   let oldest = national.fetchedAt;
-  // A state's race, or a House district's, carries the county breakdown.
-  const detailKey = chamber === 'house' ? route.district : route.state?.toLowerCase();
-  const id = detailKey ? national.data.region_results?.[detailKey]?.election_id : undefined;
+  // A state's own race carries its county breakdown (the House map stops at districts).
+  const id = route.state && chamber !== 'house' ? national.data.region_results?.[route.state.toLowerCase()]?.election_id : undefined;
   if (id) {
     const state = await getRace(id, force);
     stateRaces.set(id, state.data);
@@ -699,7 +698,7 @@ async function renderState() {
     const inState = (await loadDistricts(year)).filter((d) => d.state === postal);
     const selected = route.district ? inState.find((d) => d.id === route.district) : undefined;
     if (selected) {
-      await renderDistrict(selected, inState, regions, forecast, counties);
+      await renderDistrict(selected, inState, regions, forecast);
       return;
     }
     drawShapes(inState.map((d) => districtShape(d, regions, forecast, href({ district: d.id }))), outline);
@@ -723,17 +722,49 @@ async function renderState() {
   }
 
   if (!isLive()) {
-    // Past Senate/Governor results are statewide only, so the whole state takes the result's colour.
-    const fill = raceFill(races[0][1]);
-    drawShapes(counties.map((shape) => countyItem(shape, fill)), outline);
-    legend('County results for past Senate and Governor races aren’t packaged yet.');
-    panel.innerHTML = selectedCounty
-      ? await countyPanel(postal, selectedCounty, `<p class="muted">County results for past ${RACE_LABEL[race]} races aren’t packaged yet. Statewide:</p>${races
-          .map(([, reg]) => `<h3>${esc(reg.name)}</h3>${candidateRows(reg.candidates, 3)}`)
-          .join('')}`)
-      : races
-          .map(([, reg]) => `<h2>${esc(reg.name)}</h2><div class="meta"><span>${year} final</span></div>${candidateRows(reg.candidates)}`)
-          .join('');
+    const byRace = await getCountyResults(race, year, postal);
+    const mapped = byRace[races[0][0]];
+    const statewide = races
+      .map(([, reg]) => `<h2>${esc(reg.name)}</h2><div class="meta"><span>${year} final</span></div>${candidateRows(reg.candidates)}`)
+      .join('');
+
+    if (!mapped) {
+      // No county breakdown packaged for this race: the whole state takes the result's colour.
+      const fill = raceFill(races[0][1]);
+      drawShapes(counties.map((shape) => countyItem(shape, fill)), outline);
+      legend(`No county results for this ${RACE_LABEL[race]} race; showing the statewide result.`);
+      panel.innerHTML = selectedCounty
+        ? await countyPanel(postal, selectedCounty, `<p class="muted">No county results for this race. Statewide:</p>${races
+            .map(([, reg]) => `<h3>${esc(reg.name)}</h3>${candidateRows(reg.candidates, 3)}`)
+            .join('')}`)
+        : statewide;
+      return;
+    }
+
+    drawShapes(
+      counties.map((shape) => {
+        const reg = mapped[shape.id];
+        tips.set(
+          shape.id,
+          `<b>${esc(countyLabel(shape, postal))}</b>` +
+            (reg ? `<div class="mini">${candidateRows(reg.candidates, 3)}</div>` : '<div class="muted">No county result in data</div>'),
+        );
+        return countyItem(shape, (reg && finalFill(reg.candidates)) ?? NO_DATA);
+      }),
+      outline,
+    );
+    legend();
+    if (selectedCounty) {
+      // Every race in the state that year (regular and special) for this county.
+      const here = races
+        .map(([key, reg]) => [reg, byRace[key]?.[selectedCounty.id]] as const)
+        .filter(([, r]) => r)
+        .map(([reg, r]) => `${races.length > 1 ? `<h3>${esc(reg.name)}</h3>` : ''}${candidateRows(r!.candidates)}`)
+        .join('');
+      panel.innerHTML = await countyPanel(postal, selectedCounty, here || '<p class="muted">No county result in data.</p>');
+    } else {
+      panel.innerHTML = statewide + pastVoteBanks(mapped, counties, postal);
+    }
     return;
   }
 
@@ -895,6 +926,24 @@ async function countyPanel(postal: string, shape: Shape, current: string): Promi
       <table class="tbl"><tr class="muted"><td>Year</td><td>D</td><td>R</td><td>Margin</td><td>Votes</td></tr>${rows}</table>` : ''}`;
 }
 
+/** A finished race's biggest counties by votes, with each county's winning margin. */
+function pastVoteBanks(byFips: Record<string, Region>, counties: Shape[], postal: string): string {
+  const rows = Object.entries(byFips)
+    .map(([fips, reg]) => ({ fips, reg, total: totalVotes(reg.candidates), a: ranked(reg.candidates)[0], m: topMargin(reg.candidates) }))
+    .sort((x, y) => y.total - x.total)
+    .slice(0, 12);
+  if (!rows.length) return '';
+  const name = (fips: string) => {
+    const shape = counties.find((c) => c.id === fips);
+    return shape ? countyLabel(shape, postal).replace(/ County$/, '') : fips;
+  };
+  return `<h3>Biggest counties</h3>
+    <table class="tbl"><tr class="muted"><td>County</td><td>Votes</td><td>Margin</td></tr>${rows
+      .map((r) => `<tr><td><a href="${href({ county: r.fips })}">${esc(name(r.fips))}</a></td><td class="muted">${num(r.total)}</td>
+        <td style="color:${partyColor(r.a)}">${esc(lastName(r.a.name))} +${((r.m ?? 0) * 100).toFixed(1)}</td></tr>`)
+      .join('')}</table>`;
+}
+
 /** The biggest counties by votes counted so far: the Magic Wall "where are the votes" view. */
 function liveVoteBanks(byFips: Map<string, Region>): string {
   const rows = [...byFips.values()]
@@ -920,69 +969,32 @@ function districtCards(regions: Record<string, Region>, postal: string): string 
 }
 
 /**
- * One House district: zoomed to its lines for the selected year. Live, its counties are
- * coloured from the district race's county breakdown; past years show the district result.
- * The panel adds the seat's results in every past year.
+ * One House district: zoomed to its lines for the selected year, with neighbouring
+ * districts faded. The panel adds the seat's results in every past year.
  */
-async function renderDistrict(
-  district: District,
-  inState: District[],
-  regions: Record<string, Region>,
-  forecast: Record<string, Rating>,
-  counties: Shape[],
-) {
+async function renderDistrict(district: District, inState: District[], regions: Record<string, Region>, forecast: Record<string, Rating>) {
   const [[x0, y0], [x1, y1]] = district.bounds;
   const pad = Math.max(x1 - x0, y1 - y0) * 0.12;
   svg.setAttribute('viewBox', `${x0 - pad} ${y0 - pad} ${x1 - x0 + pad * 2} ${y1 - y0 + pad * 2}`);
 
   const region = regions[district.id];
   const live = isLive();
-  const detail = live && region?.election_id ? stateRaces.get(region.election_id) : undefined;
   // Neighbouring districts stay visible but faded, and link to their own pages.
   const others = inState
     .filter((d) => d !== district)
     .map((d) => ({ ...districtShape(d, regions, forecast, href({ district: d.id })), cls: 'race district faded' }));
-  const outline = `<path class="borders state" d="${district.d}"/>`;
-
-  const byFips = new Map<string, Region>();
-  for (const reg of Object.values(detail?.region_results ?? {})) {
-    if (reg.fips?.length === 5) byFips.set(reg.fips, reg);
-  }
-  if (byFips.size) {
-    // County breakdown for the part of each county inside the district.
-    const clipId = 'district-clip';
-    const countyShapes = counties
-      .filter((c) => byFips.has(c.id))
-      .map((shape) => {
-        const reg = byFips.get(shape.id)!;
-        tips.set(shape.id, `<b>${esc(reg.name)}</b> <span class="muted">(part in ${district.id.toUpperCase()})</span>
-          <div class="mini">${candidateRows(reg.candidates, 3)}</div><div class="muted">${pct(reg.percent_reporting)} reporting</div>`);
-        return `<path d="${path(shape)}" fill="${liveFill(reg.candidates, false) ?? NO_DATA}" class="county" data-id="${shape.id}"/>`;
-      })
-      .join('');
-    drawShapes(
-      others,
-      `<path d="${district.d}" fill="${NO_DATA}" class="district"/>
-       <clipPath id="${clipId}"><path d="${district.d}"/></clipPath>
-       <g clip-path="url(#${clipId})">${countyShapes}</g>${outline}`,
-    );
-    legend('Counties are clipped to the district; results are for the part inside it.');
-  } else {
-    drawShapes([...others, districtShape(district, regions, forecast)], outline);
-    legend('', live);
-  }
+  drawShapes([...others, districtShape(district, regions, forecast)], `<path class="borders state" d="${district.d}"/>`);
+  legend('', live);
 
   const rating = forecast[district.id.toUpperCase()];
-  const cands = detail?.candidates ?? region?.candidates;
   $('#panel').innerHTML = `
     <h2>${esc(district.id.toUpperCase())}</h2>
     <div class="meta">
       <span>${esc(district.name)}</span>
-      ${live && region ? `<span>${pct(detail?.percent_reporting ?? region.percent_reporting)} reporting</span>` : `<span>${route.year} final</span>`}
+      ${live && region ? `<span>${pct(region.percent_reporting)} reporting</span>` : `<span>${route.year} final</span>`}
       ${live && rating ? `<span class="chip">${esc(rating.rating)}</span>` : ''}
     </div>
-    ${cands ? candidateRows(cands) : `<p class="muted">No result for this district in ${route.year}.</p>`}
-    ${live && byFips.size ? liveVoteBanks(byFips) : ''}
+    ${region ? candidateRows(region.candidates) : `<p class="muted">No result for this district in ${route.year}.</p>`}
     ${seatHistory(district.id)}`;
 }
 

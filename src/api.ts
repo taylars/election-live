@@ -169,6 +169,24 @@ export type PastYear = Partial<Record<'president' | 'senate' | 'governor' | 'hou
 
 const past = new Map<number, Promise<PastYear>>();
 
+/** Past county results for one state: race key ("ga", "ga-special") → county FIPS → result. */
+export type CountyResults = Record<string, Record<string, Region>>;
+
+const countyResults = new Map<string, Promise<CountyResults>>();
+
+/** Packaged by scripts/build-senate-counties.mjs; empty where a state has none. */
+export function getCountyResults(race: string, year: number, postal: string): Promise<CountyResults> {
+  const file = `${race}-${year}-${postal.toLowerCase()}`;
+  let p = countyResults.get(file);
+  if (!p) {
+    p = fetch(`${import.meta.env.BASE_URL}data/counties/${file}.json`)
+      .then((r) => (r.ok && r.headers.get('content-type')?.includes('json') ? r.json() : {}))
+      .catch(() => ({}));
+    countyResults.set(file, p);
+  }
+  return p;
+}
+
 export function getPast(year: number): Promise<PastYear> {
   let p = past.get(year);
   if (!p) {
