@@ -59,7 +59,7 @@ export function marginFill(m: number): string {
   return tint(m >= 0 ? PARTY.D : PARTY.R, 0.25 + 0.75 * Math.min(1, Math.abs(m) / 0.4));
 }
 
-export const TOSSUP = '#5b5540';
+export const TOSSUP = '#e3c25b';
 
 /** Mixes a colour toward white; amount 0 = unchanged, 1 = white. */
 function lighten(color: string, amount: number): string {
