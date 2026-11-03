@@ -64,9 +64,11 @@ export interface Rating {
 
 const forecasts = new Map<Chamber, Promise<Record<string, Rating>>>();
 
-/** civicAPI's own pre-election ratings, keyed by upper-case postal code. Empty if unavailable. */
+/**
+ * civicAPI's own pre-election ratings, keyed by upper-case postal code
+ * ("MI"), or by district for the House ("MI-07"). Empty if unavailable.
+ */
 export function getForecast(chamber: Chamber): Promise<Record<string, Rating>> {
-  if (chamber === 'house') return Promise.resolve({});
   let p = forecasts.get(chamber);
   if (!p) {
     p = fetch(`${API}/forecast/${chamber}/2026/civicapi`)

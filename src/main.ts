@@ -8,7 +8,7 @@ import {
   NO_DATA, NO_RACE, PARTY, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
   pastMargin, ranked, ratingFill, shiftFill,
 } from './colors';
-import { POSTAL_BY_FIPS, STATES, countyKey, loadAtlas, type Atlas, type Shape } from './geo';
+import { POSTAL_BY_FIPS, STATES, countyKey, loadAtlas, loadDistricts, type Atlas, type District, type Shape } from './geo';
 
 const REFRESH_MS = 30_000;
 const W = 975;
@@ -119,6 +119,7 @@ async function load() {
       getForecast(route.chamber),
       getHistory('national'),
       route.state ? getHistory(STATES[route.state].fips) : null,
+      route.chamber === 'house' ? loadDistricts() : null,
     ]);
     error = '';
   } catch (e) {
@@ -238,14 +239,36 @@ function renderStatus() {
   }
 }
 
-function drawShapes(shapes: { shape: Shape; fill: string; cls?: string; link?: string }[], extra = '') {
+interface Drawn {
+  fill: string;
+  cls?: string;
+  link?: string;
+}
+
+/** Draws atlas shapes, or pre-projected districts, with optional overlay markup on top. */
+function drawShapes(shapes: (Drawn & ({ shape: Shape } | { district: District }))[], extra = '') {
   svg.innerHTML =
     shapes
-      .map(({ shape, fill, cls, link }) => {
-        const d = `<path d="${path(shape)}" fill="${fill}" class="${cls ?? ''}" data-id="${shape.id}"/>`;
-        return link ? `<a href="${link}">${d}</a>` : d;
+      .map((s) => {
+        const [id, d] = 'shape' in s ? [s.shape.id, path(s.shape)] : [s.district.id, s.district.d];
+        const el = `<path d="${d}" fill="${s.fill}" class="${s.cls ?? ''}" data-id="${id}"/>`;
+        return s.link ? `<a href="${s.link}">${el}</a>` : el;
       })
       .join('') + extra;
+}
+
+/** Colours one House district by its live result, or by forecast rating before votes. */
+function districtShape(district: District, forecast: Record<string, Rating>, link?: string) {
+  const region = nationalRaces.get('house')?.region_results?.[district.id];
+  const rating = forecast[district.id.toUpperCase()];
+  const fill = (region && liveFill(region.candidates)) ?? ratingFill(rating?.rating) ?? NO_DATA;
+  tips.set(
+    district.id,
+    `<b>${esc(district.id.toUpperCase())}</b>${rating ? ` <span class="chip">${esc(rating.rating)}</span>` : ''}
+     <div class="muted">${esc(district.name)}</div>
+     ${region ? `<div class="mini">${candidateRows(region.candidates, 3)}</div><div class="muted">${pct(region.percent_reporting)} reporting</div>` : ''}`,
+  );
+  return { district, fill, cls: 'race district', link };
 }
 
 svg.addEventListener('mousemove', (e) => {
@@ -307,6 +330,16 @@ async function renderNation(history: History) {
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
 
   const past = mode !== 'live' && mode !== 'shift' ? history[mode] : undefined;
+  if (chamber === 'house' && !past) {
+    const districts = await loadDistricts();
+    drawShapes(
+      districts.map((d) => districtShape(d, forecast, href({ state: d.state }))),
+      `<path class="borders" d="${path(atlas.stateBorders)}"/><path class="borders" d="${path(atlas.nation as never)}"/>`,
+    );
+    legend('live', 'Lighter shades before votes: forecast rating');
+    $('#panel').innerHTML = race ? balance(race) + houseList(race) : `<p class="muted">Loading results…</p>`;
+    return;
+  }
   let usedForecast = false;
   const shapes = atlas.states.map((shape) => {
     const postal = POSTAL_BY_FIPS[shape.id];
@@ -317,7 +350,6 @@ async function renderNation(history: History) {
       tips.set(shape.id, `<b>${name}</b><div>${mode} president: ${fmtMargin(pastMargin(p))}</div><div class="muted">${num(p.t)} votes</div>`);
       return { shape, fill: marginFill(pastMargin(p)), link: href({ state: postal }) };
     }
-    if (chamber === 'house') return houseState(shape, postal, name);
     const region = postal && stateRegion(chamber, postal);
     if (!region) {
       tips.set(shape.id, `<b>${name}</b><div class="muted">No ${CHAMBER[chamber].label.toLowerCase()} race</div>`);
@@ -344,28 +376,9 @@ async function renderNation(history: History) {
   }
   if (past) {
     panel.innerHTML = balance(race) + pastSummary(past, mode);
-  } else if (chamber === 'house') {
-    panel.innerHTML = balance(race) + houseList(race);
   } else {
     panel.innerHTML = balance(race) + raceList(race, forecast);
   }
-}
-
-function houseState(shape: Shape, postal: string, name: string) {
-  const districts = houseDistricts(postal);
-  if (!districts.length) return { shape, fill: NO_RACE };
-  let d = 0, r = 0, counted = 0;
-  for (const [, reg] of districts) {
-    const lead = ranked(reg.candidates)[0];
-    if (!lead || !reg.candidates.some((c) => c.votes)) continue;
-    counted++;
-    if (side(lead.party) === 'D') d++;
-    else if (side(lead.party) === 'R') r++;
-  }
-  tips.set(shape.id, `<b>${name}</b><div>${districts.length} district${districts.length > 1 ? 's' : ''}</div>
-    <div>Leading: <span style="color:${PARTY.D}">D ${d}</span> · <span style="color:${PARTY.R}">R ${r}</span></div>`);
-  const fill = counted ? marginFill((d - r) / counted / 2.5) : NO_DATA;
-  return { shape, fill, cls: 'race', link: href({ state: postal }) };
 }
 
 function balance(race: Race): string {
@@ -525,16 +538,23 @@ async function renderState(years: string[]) {
     tips.set(shape.id, lines.join(''));
     return { shape, fill, cls: 'county' };
   });
-  drawShapes(shapes, stateShape ? `<path class="borders state" d="${path(stateShape)}"/>` : '');
+  const outline = stateShape ? `<path class="borders state" d="${path(stateShape)}"/>` : '';
+  if (chamber === 'house' && mode === 'live') {
+    const forecast = await getForecast('house');
+    const inState = (await loadDistricts()).filter((d) => d.state === postal);
+    drawShapes(inState.map((d) => districtShape(d, forecast)), outline);
+    legend('live', 'Lighter shades before votes: forecast rating');
+    $('#panel').innerHTML = districtCards(postal);
+    return;
+  }
+  drawShapes(shapes, outline);
 
   const matched = byFips.size;
   const regionCount = Object.values(race?.region_results ?? {}).filter((r) => r.type !== 'State').length;
   const note =
-    chamber === 'house' && mode === 'live'
-      ? 'District shapes aren’t mapped yet. Switch to a past year to see counties.'
-      : race && regionCount && matched < regionCount / 2
-        ? 'This race reports by areas that don’t match county shapes; see the table.'
-        : '';
+    race && regionCount && matched < regionCount / 2
+      ? 'This race reports by areas that don’t match county shapes; see the table.'
+      : '';
   legend(mode === 'shift' ? 'shift' : 'past', note);
 
   const panel = $('#panel');

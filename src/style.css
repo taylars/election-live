@@ -59,6 +59,7 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: 
 #map { width: 100%; flex: 1; max-height: calc(100vh - 190px); min-height: 280px; }
 #map path { stroke: var(--bg); stroke-width: 0.6; vector-effect: non-scaling-stroke; transition: fill 0.4s; }
 #map .county { stroke-width: 0.4; }
+#map .district { stroke-width: 0.35; }
 #map a path:hover, #map path.county:hover { stroke: #fff; stroke-width: 2; }
 #map a { cursor: pointer; }
 #map .borders { fill: none; stroke: #6b7486; stroke-width: 1; pointer-events: none; }

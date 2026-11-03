@@ -1,3 +1,4 @@
+import { geoAlbersUsa, geoPath } from 'd3-geo';
 import { feature, mesh } from 'topojson-client';
 import type { Topology, GeometryCollection } from 'topojson-specification';
 import type { Feature, FeatureCollection, Geometry, MultiLineString } from 'geojson';
@@ -33,6 +34,7 @@ export interface Atlas {
   states: Shape[];
   counties: Shape[];
   countyBorders: MultiLineString;
+  stateBorders: MultiLineString;
   nation: Feature;
 }
 
@@ -50,10 +52,41 @@ export function loadAtlas(): Promise<Atlas> {
         states,
         counties,
         countyBorders: mesh(topo, o.counties, (a, b) => a !== b),
+        stateBorders: mesh(topo, o.states, (a, b) => a !== b),
         nation: feature(topo, o.nation as GeometryCollection) as unknown as Feature,
       };
     });
   return atlas;
+}
+
+/** A 2026 congressional district, already projected to an SVG path in the atlas frame. */
+export interface District {
+  id: string; // civicAPI key, e.g. "mi-07"
+  state: string; // postal code, upper case
+  name: string;
+  d: string;
+}
+
+let districts: Promise<District[]> | undefined;
+
+/** Loads the 2026 district lines (lon/lat) and projects them to match the us-atlas Albers frame. */
+export function loadDistricts(): Promise<District[]> {
+  districts ??= fetch(`${import.meta.env.BASE_URL}data/districts-2026.json`)
+    .then((r) => r.json())
+    .then((topo: Topology) => {
+      type Props = { id: string; state: string; name: string };
+      const o = topo.objects.districts as GeometryCollection<Props>;
+      const fc = feature(topo, o) as FeatureCollection<Geometry, Props>;
+      // us-atlas's *-albers-10m files use exactly this projection.
+      const project = geoPath(geoAlbersUsa().scale(1300).translate([487.5, 305]));
+      return fc.features.map((f) => ({
+        id: f.properties.id,
+        state: f.properties.state.toUpperCase(),
+        name: f.properties.name,
+        d: project(f) ?? '',
+      }));
+    });
+  return districts;
 }
 
 const SUFFIX = /\s+(county|parish|borough|census area|municipality|city and borough|city)$/;
