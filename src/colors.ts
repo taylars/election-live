@@ -103,3 +103,9 @@ export function ratingFill(rating: string | undefined): string | null {
 export function fmtMargin(m: number): string {
   return `${m >= 0 ? 'D' : 'R'}+${(Math.abs(m) * 100).toFixed(1)}`;
 }
+
+/** Swing map colour: the party the place moved toward, deeper the bigger the shift (full at 15 points). */
+export function swingFill(s: number): string {
+  if (Math.abs(s) < 0.0005) return lighten(BASE, 0.25);
+  return tint(s > 0 ? PARTY.D : PARTY.R, 0.2 + 0.8 * Math.min(1, Math.abs(s) / 0.15));
+}

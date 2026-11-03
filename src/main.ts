@@ -6,11 +6,14 @@ import {
 } from './api';
 import {
   LEVEL_FILL, NO_DATA, NO_RACE, PARTY, TOSSUP, finalFill, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
-  pastMargin, ranked, ratingFill,
+  pastMargin, ranked, ratingFill, swingFill,
 } from './colors';
 import { ALL_YEARS, LIVE_YEAR, RACE_LABEL, SEATED, YEARS, electoralVotes, type RaceKind } from './elections';
 import { POSTAL_BY_FIPS, STATES, countyKey, loadAtlas, loadDistricts, type Atlas, type District, type Shape } from './geo';
 import { MIN_REPORTING, projectRace, projected, projectionLabel, tally } from './projection';
+import {
+  areaSwing, baselineId, baselineLabel, baselineOptions, fmtSwing, margin, parseBaseline, toDR, type AreaSwing, type Baseline,
+} from './swing';
 
 const W = 975;
 const H = 610;
@@ -21,6 +24,7 @@ interface Route {
   state?: string; // postal code, upper case
   district?: string; // House only, e.g. "mi-07"
   county?: string; // county FIPS, other races only, e.g. "13121"
+  vs?: Baseline; // swing view: the election to compare against
 }
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -37,7 +41,7 @@ app.innerHTML = `
   </header>
   <main class="wall">
     <section class="map-wrap">
-      <div class="crumbs" id="crumbs"></div>
+      <div class="mapbar"><div class="crumbs" id="crumbs"></div><nav class="modes view" id="view"></nav></div>
       <svg id="map" viewBox="0 0 ${W} ${H}" role="img" aria-label="Results map"></svg>
       <div class="legend" id="legend"></div>
       <div class="tip" id="tip" hidden></div>
@@ -75,16 +79,18 @@ let tips = new Map<string, string>();
 /**
  * Routes look like #/senate/2024/ga: race, year, then an optional state. Below a state,
  * the House can open a district (#/house/2024/mi/07) and the other races a county
- * (#/senate/2026/ga/county/13121).
+ * (#/senate/2026/ga/county/13121). `?vs=president-2024` switches to the swing view.
  */
 function parseRoute(): Route {
-  const [r, y, s, d, e] = location.hash.replace(/^#\/?/, '').split('?')[0].split('/');
+  const [where, query] = location.hash.replace(/^#\/?/, '').split('?');
+  const [r, y, s, d, e] = where.split('/');
   const race: RaceKind = r in RACE_LABEL ? (r as RaceKind) : 'senate';
   const year = YEARS[race].includes(Number(y)) ? Number(y) : YEARS[race][0];
   const state = s && STATES[s.toUpperCase()] ? s.toUpperCase() : undefined;
   const district = race === 'house' && state && /^(\d{2}|al)$/.test(d ?? '') ? `${state.toLowerCase()}-${d}` : undefined;
   const county = race !== 'house' && state && d === 'county' && e?.length === 5 && e.startsWith(STATES[state].fips) ? e : undefined;
-  return { race, year, state, district, county };
+  const vs = parseBaseline(new URLSearchParams(query).get('vs'), race, year);
+  return { race, year, state, district, county, vs };
 }
 
 function href(r: Partial<Route>): string {
@@ -99,7 +105,10 @@ function href(r: Partial<Route>): string {
   } else if (next.race !== 'house' && st && next.county?.startsWith(st.fips)) {
     below = `/county/${next.county}`;
   }
-  return `#/${next.race}/${year}${next.state ? `/${next.state.toLowerCase()}` : ''}${below}`;
+  // Keep the swing view across races and years where the baseline still applies, or the
+  // same year's race of the new kind (Senate vs 2022 Senate → Governor vs 2022 Governor).
+  const vs = next.vs && (parseBaseline(baselineId(next.vs), next.race, year) ?? parseBaseline(baselineId({ race: next.race, year: next.vs.year }), next.race, year));
+  return `#/${next.race}/${year}${next.state ? `/${next.state.toLowerCase()}` : ''}${below}${vs ? `?vs=${baselineId(vs)}` : ''}`;
 }
 
 window.addEventListener('hashchange', () => {
@@ -150,6 +159,37 @@ async function fetchCurrent(force = false) {
   lastFetch = oldest;
 }
 
+const needsSwingStates = () => isLive() && !!route.vs && !route.state && route.race !== 'house';
+/** True while the national swing view is still loading state races. */
+let swingStatesLoading = false;
+
+/**
+ * The national swing view compares each state county by county, so it needs every state
+ * race with votes in (none before polls close). Fetched a few at a time after the map is
+ * up, re-rendering as each batch lands; until then states show their statewide swing.
+ */
+async function fetchSwingStates(force = false) {
+  if (!needsSwingStates()) return;
+  const national = nationalRaces.get(route.race as Chamber);
+  const ids = Object.values(national?.region_results ?? {})
+    .filter((r) => r.election_id && totalVotes(r.candidates) > 0)
+    .map((r) => r.election_id!);
+  swingStatesLoading = true;
+  try {
+    for (let i = 0; i < ids.length; i += 6) {
+      const batch = await Promise.all(ids.slice(i, i + 6).map((id) => getRace(id, force)));
+      batch.forEach((got, j) => {
+        stateRaces.set(ids[i + j], got.data);
+        lastFetch = Math.min(lastFetch, got.fetchedAt);
+      });
+      if (i + 6 < ids.length && needsSwingStates()) render();
+    }
+  } finally {
+    swingStatesLoading = false;
+  }
+  if (needsSwingStates()) render();
+}
+
 async function load() {
   render(); // immediate feedback from whatever is in memory
   try {
@@ -165,18 +205,20 @@ async function load() {
     // District pages list the seat's past results and state House pages the past delegations.
     const allPast = race === 'house' && state;
     const pastYears = allPast ? ALL_YEARS.filter((y) => y !== LIVE_YEAR) : isLive() ? [] : [year];
+    if (route.vs) pastYears.push(route.vs.year);
     for (const y of pastYears) {
       if (!pastData.has(y)) tasks.push(getPast(y).then((p) => pastData.set(y, p)));
     }
     if (race === 'house') tasks.push(loadDistricts(year));
     // County presidential results back the President map and every county page.
-    if (state && (race === 'president' || route.county)) tasks.push(getHistory(STATES[state].fips));
+    if (state && (race === 'president' || route.county || route.vs?.race === 'president')) tasks.push(getHistory(STATES[state].fips));
     await Promise.all(tasks);
     error = '';
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
   }
   await render();
+  fetchSwingStates().catch((e) => (error = e instanceof Error ? e.message : String(e)));
 }
 
 function readPolling(): boolean {
@@ -201,6 +243,8 @@ async function refresh() {
   lastPoll = Date.now();
   try {
     await fetchCurrent(true);
+    render();
+    await fetchSwingStates(true);
     error = '';
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
@@ -280,6 +324,15 @@ function renderTabs() {
     }
     return `<a href="${href({ year: y })}" class="${y === route.year ? 'on' : ''}">${label}</a>`;
   }).join('');
+  // Results or swing against an earlier election (not on a district page).
+  const options = route.district ? [] : baselineOptions(route.race, route.year);
+  const view = $('#view');
+  view.hidden = !options.length;
+  view.innerHTML = options.length
+    ? `<a href="${href({ vs: undefined })}" class="${route.vs ? '' : 'on'}">Results</a><span class="label">Swing vs</span>${options
+        .map((b) => `<a href="${href({ vs: b })}" class="${route.vs && baselineId(route.vs) === baselineId(b) ? 'on' : ''}" title="Shift since ${baselineLabel(b)}">${baselineLabel(b, true)}</a>`)
+        .join('')}`
+    : '';
 }
 
 function renderStatus() {
@@ -412,6 +465,10 @@ async function renderNation() {
   $('#crumbs').innerHTML = `<b>United States</b> · ${year} ${RACE_LABEL[race]}`;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
   const panel = $('#panel');
+  if (route.vs) {
+    await renderNationSwing(regions, forecast);
+    return;
+  }
 
   if (race === 'house') {
     const districts = await loadDistricts(year);
@@ -707,13 +764,20 @@ async function renderState() {
       await renderDistrict(selected, inState, regions, forecast);
       return;
     }
+    if (route.vs) {
+      const places = new Map(districtsIn(regions, postal).map(([k, reg]) => [k, districtSwing(k, reg)]));
+      drawShapes(inState.map((d) => swingShape({ district: d }, d.id.toUpperCase(), places.get(d.id), href({ district: d.id }))), outline);
+      swingLegend('District lines can change between elections.');
+      panel.innerHTML = stateHouseTally(regions, postal, forecast) + swingSummary([...places.values()], 'districts') + swingTable([...places.values()]);
+      return;
+    }
     drawShapes(inState.map((d) => districtShape(d, regions, forecast, href({ district: d.id }))), outline);
     legend('', isLive());
     panel.innerHTML = stateHouseTally(regions, postal, forecast) + districtCards(regions, postal);
     return;
   }
 
-  if (race === 'president') {
+  if (race === 'president' && !route.vs) {
     await renderPresidentState(postal, regions, counties, outline);
     return;
   }
@@ -724,6 +788,11 @@ async function renderState() {
     legend();
     const none = `<p class="muted">No ${RACE_LABEL[race].toLowerCase()} race in ${st.name} in ${year}.</p>`;
     panel.innerHTML = selectedCounty ? await countyPanel(postal, selectedCounty, none) : `<h2>${st.name}</h2>${none}`;
+    return;
+  }
+
+  if (route.vs) {
+    await renderStateSwing(postal, races[0], counties, outline, selectedCounty);
     return;
   }
 
@@ -777,15 +846,7 @@ async function renderState() {
   // Live: county results from the state's own civicAPI race.
   const region = races[0][1];
   const stateRace = region.election_id ? stateRaces.get(region.election_id) : undefined;
-  const byFips = new Map<string, Region>();
-  if (stateRace?.region_results) {
-    const byName = new Map(counties.map((c) => [countyKey(c.properties.name), c.id]));
-    for (const reg of Object.values(stateRace.region_results)) {
-      if (reg.type === 'State') continue;
-      const fips = reg.fips && reg.fips.length === 5 ? reg.fips : byName.get(countyKey(reg.name));
-      if (fips) byFips.set(fips, reg);
-    }
-  }
+  const byFips = stateRace ? liveCountyRegions(stateRace, counties) : new Map<string, Region>();
   drawShapes(
     counties.map((shape) => {
       const reg = byFips.get(shape.id);
@@ -823,6 +884,18 @@ async function renderState() {
     ${candidateRows(stateRace?.candidates ?? region.candidates)}
     ${races.slice(1).map(([, reg]) => `<h2 class="sub">${esc(reg.name)}</h2>${candidateRows(reg.candidates)}`).join('')}
     ${liveVoteBanks(byFips)}`;
+}
+
+/** A live state race's county results by county FIPS (matched by name where civicAPI gives none). */
+function liveCountyRegions(stateRace: Race, counties: Shape[]): Map<string, Region> {
+  const byFips = new Map<string, Region>();
+  const byName = new Map(counties.map((c) => [countyKey(c.properties.name), c.id]));
+  for (const reg of Object.values(stateRace.region_results ?? {})) {
+    if (reg.type === 'State') continue;
+    const fips = reg.fips && reg.fips.length === 5 ? reg.fips : byName.get(countyKey(reg.name));
+    if (fips) byFips.set(fips, reg);
+  }
+  return byFips;
 }
 
 async function renderPresidentState(postal: string, regions: Record<string, Region>, counties: Shape[], outline: string) {
@@ -1082,6 +1155,274 @@ function seatHistory(key: string): string {
     ? `<h3>Past results for ${esc(key.toUpperCase())}</h3><table class="tbl">${rows}</table>
        <p class="muted small">District lines can change between elections (2022 redistricting, plus some 2024 and 2026 redraws).</p>`
     : '';
+}
+
+// ----- swing view -----
+
+/** One place's shift against the baseline: margins are D minus R as a share of the vote. */
+interface PlaceSwing {
+  title: string;
+  link?: string;
+  base: number | null;
+  now: number | null;
+  /** Live statewide races: the county-by-county swing; otherwise now minus base. */
+  swing: number | null;
+  /** Live: baseline margin plus swing, a rough final margin. */
+  estimate: number | null;
+  /** Votes counted now, for weighting. */
+  votes: number;
+  counties?: AreaSwing | null;
+}
+
+const sideColor = (m: number) => (m >= 0 ? PARTY.D : PARTY.R);
+const marginSpan = (m: number | null | undefined) =>
+  m == null ? '<span class="muted">–</span>' : `<span style="color:${sideColor(m)}">${fmtMargin(m)}</span>`;
+const swingSpan = (s: number | null | undefined) =>
+  s == null ? '<span class="muted">–</span>' : `<span style="color:${sideColor(s)}">${fmtSwing(s)}</span>`;
+
+function byArea(entries: [string, Region][]): Record<string, PastResult> {
+  const out: Record<string, PastResult> = {};
+  for (const [id, reg] of entries) {
+    const dr = toDR(reg.candidates);
+    if (dr) out[id] = dr;
+  }
+  return out;
+}
+
+/** The baseline's result for a key in the current view ("ga", "ga-special", "mi-07"). */
+function baselineResult(key: string): PastResult | null {
+  const vs = route.vs!;
+  const regions = pastData.get(vs.year)?.[vs.race] ?? {};
+  const reg = regions[key] ?? (vs.race === 'house' ? undefined : regions[key.split('-')[0]]);
+  return reg ? toDR(reg.candidates) : null;
+}
+
+/** The baseline's county results in a state, by county FIPS. */
+async function baselineCounties(postal: string, key: string): Promise<Record<string, PastResult>> {
+  const vs = route.vs!;
+  if (vs.race === 'president') return (await getHistory(STATES[postal].fips))[vs.year] ?? {};
+  const byRace = await getCountyResults(vs.race, vs.year, postal);
+  return byArea(Object.entries(byRace[key] ?? byRace[key.split('-')[0]] ?? {}));
+}
+
+/** The current view's county results in a state, by county FIPS. */
+async function currentCounties(postal: string, key: string, region: Region): Promise<Record<string, PastResult>> {
+  if (isLive()) {
+    const race = region.election_id ? stateRaces.get(region.election_id) : undefined;
+    const counties = atlas.counties.filter((c) => c.id.startsWith(STATES[postal].fips));
+    return race ? byArea([...liveCountyRegions(race, counties)]) : {};
+  }
+  if (route.race === 'president') return (await getHistory(STATES[postal].fips))[route.year] ?? {};
+  return byArea(Object.entries((await getCountyResults(route.race, route.year, postal))[key] ?? {}));
+}
+
+/**
+ * A statewide race's swing. Live, it compares the counties that have reported with the
+ * same counties in the baseline, so a count that starts in friendly territory doesn't
+ * read as a swing; the estimate applies that swing to the baseline's statewide margin.
+ */
+async function stateSwing(postal: string, key: string, region: Region, title: string, link?: string): Promise<PlaceSwing> {
+  const baseDR = baselineResult(key);
+  const nowDR = toDR(region.candidates);
+  const base = baseDR && margin(baseDR);
+  const now = nowDR && margin(nowDR);
+  let swing = base != null && now != null ? now - base : null;
+  let counties: AreaSwing | null = null;
+  if (isLive() && base != null && nowDR) {
+    const [cur, prev] = await Promise.all([currentCounties(postal, key, region), baselineCounties(postal, key)]);
+    counties = areaSwing(Object.entries(cur), prev);
+    if (counties) swing = counties.swing;
+  }
+  const estimate = isLive() && base != null && swing != null ? base + swing : null;
+  return { title, link, base, now, swing, estimate, votes: nowDR?.t ?? 0, counties };
+}
+
+/** A House district's shift on the same district number (lines may have moved). */
+function districtSwing(key: string, region: Region): PlaceSwing {
+  const baseDR = baselineResult(key);
+  const nowDR = toDR(region.candidates);
+  const base = baseDR && margin(baseDR);
+  const now = nowDR && margin(nowDR);
+  const swing = base != null && now != null ? now - base : null;
+  return { title: key.toUpperCase(), link: href({ state: key.split('-')[0].toUpperCase(), district: key }), base, now, swing, estimate: null, votes: nowDR?.t ?? 0 };
+}
+
+function swingTip(title: string, p: PlaceSwing | undefined): string {
+  const vs = route.vs!;
+  if (!p) return `<b>${esc(title)}</b><div class="muted">No ${RACE_LABEL[route.race].toLowerCase()} race in ${route.year}</div>`;
+  const rows = [
+    [baselineLabel(vs), marginSpan(p.base)],
+    [`${route.year}${isLive() ? ' so far' : ''}`, marginSpan(p.now)],
+    ['Swing', swingSpan(p.swing) + (p.counties ? ` <span class="muted">(${p.counties.matched} counties)</span>` : '')],
+    ...(p.estimate != null ? [['Estimate', marginSpan(p.estimate)]] : []),
+  ];
+  return `<b>${esc(title)}</b><table class="tiptbl">${rows.map(([a, b]) => `<tr><td class="muted">${a}</td><td>${b}</td></tr>`).join('')}</table>`;
+}
+
+function swingShape(item: { shape: Shape } | { district: District }, title: string, p: PlaceSwing | undefined, link?: string) {
+  const id = 'shape' in item ? item.shape.id : item.district.id;
+  tips.set(id, swingTip(title, p));
+  const fill = p?.swing != null ? swingFill(p.swing) : p ? NO_DATA : NO_RACE;
+  return { ...item, fill, cls: `race${'district' in item ? ' district' : ''}`, link };
+}
+
+function swingLegend(note = '') {
+  const items: [string, string][] = [
+    [swingFill(-0.15), 'R +15'], [swingFill(-0.05), 'R +5'], [swingFill(0), 'No change'],
+    [swingFill(0.05), 'D +5'], [swingFill(0.15), 'D +15'], [NO_DATA, 'No comparison'],
+  ];
+  $('#legend').innerHTML =
+    `<div class="legend-row"><span class="muted">Shift since ${baselineLabel(route.vs!)}:</span>${items
+      .map(([c, l]) => `<span><i style="background:${c}"></i>${l}</span>`)
+      .join('')}</div>` + (note ? `<div class="legend-row muted">${note}</div>` : '');
+}
+
+/** The vote-weighted average swing across places, as a headline. */
+function swingSummary(places: PlaceSwing[], unit: string): string {
+  const counted = places.filter((p) => p.swing != null && p.votes > 0);
+  const votes = counted.reduce((n, p) => n + p.votes, 0);
+  const vs = route.vs!;
+  if (!votes) {
+    return `<div class="swing"><div class="muted">No ${unit} to compare with ${baselineLabel(vs)} yet${isLive() ? ': swing appears as votes come in' : ''}.</div></div>`;
+  }
+  const avg = counted.reduce((n, p) => n + p.swing! * p.votes, 0) / votes;
+  const toward = (s: number) => counted.filter((p) => Math.sign(p.swing!) === s).length;
+  return `
+    <div class="swing">
+      <div class="big" style="color:${sideColor(avg)}">${fmtSwing(avg)}</div>
+      <div class="muted">Average shift since ${baselineLabel(vs)} across ${counted.length} ${unit}, weighted by votes${isLive() ? ' counted so far' : ''}.</div>
+      <div class="rows">
+        <span>Shifted toward Democrats</span><span style="color:${PARTY.D}">${toward(1)}</span>
+        <span>Shifted toward Republicans</span><span style="color:${PARTY.R}">${toward(-1)}</span>
+      </div>
+      ${isLive() && route.race !== 'house' ? `<p class="muted small">${swingStatesLoading ? 'Loading county results; statewide swings for now. ' : ''}Each state compares its reported counties with the same counties in ${baselineLabel(vs)}. Estimate = ${vs.year} margin + swing.</p>` : ''}
+    </div>`;
+}
+
+/** Places sorted from the biggest shift toward Democrats to the biggest toward Republicans. */
+function swingTable(places: PlaceSwing[], limit = 0): string {
+  const vs = route.vs!;
+  const live = isLive();
+  let rows = places.filter((p) => p.swing != null).sort((a, b) => b.swing! - a.swing!);
+  let title = 'Swing by race';
+  if (limit && rows.length > limit * 2) {
+    rows = [...rows.slice(0, limit), ...rows.slice(-limit)];
+    title = `Biggest shifts each way`;
+  }
+  if (!rows.length) return '';
+  const showEst = live && rows.some((p) => p.estimate != null);
+  return `<h3>${title}</h3>
+    <table class="tbl"><tr class="muted"><td></td><td>${vs.year}</td><td>${route.year}</td><td>Swing</td>${showEst ? '<td>Est.</td>' : ''}</tr>${rows
+      .map((p) => `<tr><td>${p.link ? `<a href="${p.link}">${esc(p.title)}</a>` : esc(p.title)}</td><td>${marginSpan(p.base)}</td>
+        <td>${marginSpan(p.now)}</td><td><b>${swingSpan(p.swing)}</b></td>${showEst ? `<td>${marginSpan(p.estimate)}</td>` : ''}</tr>`)
+      .join('')}</table>`;
+}
+
+async function renderNationSwing(regions: Record<string, Region>, forecast: Record<string, Rating>) {
+  const { race } = route;
+  const live = isLive();
+  const panel = $('#panel');
+  const national = live ? nationalRaces.get(race as Chamber) : undefined;
+  const head = race === 'president' ? electoralTally(regions)
+    : live ? (national ? balance(national, forecast) : '')
+    : race === 'house' ? houseTally(regions)
+    : seatedTally(regions);
+
+  if (race === 'house') {
+    const districts = await loadDistricts(route.year);
+    const places = new Map(Object.entries(regions).map(([k, reg]) => [k, districtSwing(k, reg)]));
+    drawShapes(
+      districts.map((d) => swingShape({ district: d }, d.id.toUpperCase(), places.get(d.id), href({ state: d.state }))),
+      `<path class="borders" d="${path(atlas.stateBorders)}"/><path class="borders" d="${path(atlas.nation as never)}"/>`,
+    );
+    swingLegend('Each district against the same district number; lines can change between elections.');
+    panel.innerHTML = head + swingSummary([...places.values()], 'districts') + swingTable([...places.values()], 10);
+    return;
+  }
+
+  const places = new Map<string, PlaceSwing>();
+  await Promise.all(
+    atlas.states.map(async (shape) => {
+      const postal = POSTAL_BY_FIPS[shape.id];
+      const [key, reg] = postal ? stateRaceRegions(regions, postal)[0] ?? [] : [];
+      if (key && reg) places.set(shape.id, await stateSwing(postal, key, reg, STATES[postal]?.name ?? reg.name, href({ state: postal })));
+    }),
+  );
+  drawShapes(
+    atlas.states.map((shape) => swingShape({ shape }, STATES[POSTAL_BY_FIPS[shape.id]]?.name ?? shape.properties.name, places.get(shape.id), places.get(shape.id)?.link)),
+    `<path class="borders" d="${path(atlas.nation as never)}"/>`,
+  );
+  swingLegend(race === 'president' ? '' : `Against ${baselineLabel(route.vs!)} in the same state${route.vs!.race === route.race ? ' (a different seat or term in some states)' : ''}.`);
+  panel.innerHTML = head + swingSummary([...places.values()], 'races') + swingTable([...places.values()]);
+}
+
+/** A state's race against the baseline, county by county. */
+async function renderStateSwing(postal: string, [key, region]: [string, Region], counties: Shape[], outline: string, selected?: Shape) {
+  const vs = route.vs!;
+  const live = isLive();
+  const [now, base] = await Promise.all([currentCounties(postal, key, region), baselineCounties(postal, key)]);
+  const place = await stateSwing(postal, key, region, STATES[postal].name);
+  const countySwing = (fips: string) => (now[fips] && base[fips] ? margin(now[fips]) - margin(base[fips]) : null);
+
+  drawShapes(
+    counties.map((shape) => {
+      const s = countySwing(shape.id);
+      const p: PlaceSwing = {
+        title: countyLabel(shape, postal), base: base[shape.id] ? margin(base[shape.id]) : null, now: now[shape.id] ? margin(now[shape.id]) : null,
+        swing: s, estimate: null, votes: now[shape.id]?.t ?? 0,
+      };
+      tips.set(shape.id, swingTip(p.title, p) + (p.votes ? `<div class="muted">${num(p.votes)} votes${live ? ' so far' : ''}</div>` : ''));
+      return countyItem(shape, s == null ? NO_DATA : swingFill(s));
+    }),
+    outline,
+  );
+  const missing = !Object.keys(base).length ? `No county results for ${baselineLabel(vs)} in ${STATES[postal].name}.`
+    : !live && !Object.keys(now).length ? `No county results for this race in ${route.year}.` : '';
+  swingLegend(missing);
+
+  if (selected) {
+    const p: PlaceSwing = {
+      title: '', base: base[selected.id] ? margin(base[selected.id]) : null, now: now[selected.id] ? margin(now[selected.id]) : null,
+      swing: countySwing(selected.id), estimate: null, votes: now[selected.id]?.t ?? 0,
+    };
+    $('#panel').innerHTML = await countyPanel(postal, selected, swingRows(p));
+    return;
+  }
+
+  // The biggest counties by votes now, where the swing moves the most votes.
+  const rows = Object.entries(now)
+    .filter(([f]) => base[f])
+    .sort(([, a], [, b]) => b.t - a.t)
+    .slice(0, 15)
+    .map(([f, cur]) => {
+      const shape = counties.find((c) => c.id === f);
+      return `<tr><td><a href="${href({ county: f })}">${esc(shape ? countyLabel(shape, postal).replace(/ County$/, '') : f)}</a></td>
+        <td>${marginSpan(margin(base[f]))}</td><td>${marginSpan(margin(cur))}</td><td><b>${swingSpan(margin(cur) - margin(base[f]))}</b></td></tr>`;
+    })
+    .join('');
+  $('#panel').innerHTML = `
+    <h2>${esc(region.name)}</h2>
+    <div class="meta"><span>vs ${baselineLabel(vs)}</span>${live ? `<span>${pct(region.percent_reporting)} reporting</span>` : `<span>${route.year} final</span>`}</div>
+    ${swingRows(place, true)}
+    ${rows ? `<h3>Biggest counties</h3><table class="tbl"><tr class="muted"><td></td><td>${vs.year}</td><td>${route.year}</td><td>Swing</td></tr>${rows}</table>` : ''}`;
+}
+
+/** The swing box for one place: headline shift, then baseline, now and estimate. */
+function swingRows(p: PlaceSwing, statewide = false): string {
+  const vs = route.vs!;
+  const live = isLive();
+  const basis = p.counties ? `in ${p.counties.matched} reporting counties` : statewide && live ? 'statewide, so far' : '';
+  return `
+    <div class="swing">
+      ${p.swing != null
+        ? `<div class="big" style="color:${sideColor(p.swing)}">${fmtSwing(p.swing)}</div><div class="muted">Shift since ${baselineLabel(vs)}${basis ? ` ${basis}` : ''}</div>`
+        : `<div class="muted">${p.now == null && live ? 'No votes to compare yet.' : `Nothing to compare: ${p.base == null ? `no D-vs-R result in ${baselineLabel(vs)}` : `no D-vs-R result in ${route.year}`}.`}</div>`}
+      <div class="rows">
+        <span>${baselineLabel(vs)}</span>${marginSpan(p.base)}
+        <span>${route.year}${live ? ' so far' : ''}</span>${marginSpan(p.now)}
+        ${p.estimate != null ? `<span>Estimated final</span>${marginSpan(p.estimate)}` : ''}
+      </div>
+    </div>`;
 }
 
 load();

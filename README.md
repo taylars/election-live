@@ -15,7 +15,8 @@ It's a static site (Vite + TypeScript + d3-geo) that runs on GitHub Pages. For 2
 - **County** (President, Senate, Governor): click a county on a state's map. Shows the selected race in that county (live 2026, or past presidential, Senate and Governor results) and the county's past presidential results.
 - **State House delegation**: a state's House page tallies its seats by party (live: called seats plus the projection; past: seats won) and lists the delegation in other years.
 - **District** (House): click a district on a state's map, or its card, for its result and the seat's results in 2020–2024.
-- URLs are shareable, e.g. `#/senate/2024/ga`, `#/house/2026/mi/07` or `#/senate/2026/ga/county/13121`.
+- **Swing**: above the map, switch from *Results* to *Swing vs* an earlier election: an earlier presidential race, or an earlier race for the same office (House: the same district number in an earlier year). The map shades each state, county or district by how far it moved toward either party, and the panel gives the vote-weighted average shift and a table of shifts. Live, each state's swing compares only the counties that have reported with the same counties in the baseline, so an early count from friendly territory doesn't look like a swing, and the *estimate* is the baseline's statewide margin plus that swing. The national live view loads every state race with votes to do this (a few at a time, after the map appears; statewide swings show until then).
+- URLs are shareable, e.g. `#/senate/2024/ga`, `#/house/2026/mi/07` or `#/senate/2026/ga/county/13121`; the swing view adds `?vs=president-2024`.
 - Add `?testdata` to the URL (e.g. `/?testdata#/senate/2026`) to have civicAPI fill the races with simulated votes, for rehearsing before polls close.
 
 ### Live updates and caching
