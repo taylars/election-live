@@ -41,7 +41,7 @@ app.innerHTML = `
   </header>
   <main class="wall">
     <section class="map-wrap">
-      <div class="mapbar"><div class="crumbs" id="crumbs"></div><nav class="modes view" id="view"></nav></div>
+      <div class="mapbar"><div class="crumbs" id="crumbs"></div><label class="view" id="view">View <select></select></label></div>
       <svg id="map" viewBox="0 0 ${W} ${H}" role="img" aria-label="Results map"></svg>
       <div class="legend" id="legend"></div>
       <div class="tip" id="tip" hidden></div>
@@ -328,12 +328,16 @@ function renderTabs() {
   const options = route.district ? [] : baselineOptions(route.race, route.year);
   const view = $('#view');
   view.hidden = !options.length;
-  view.innerHTML = options.length
-    ? `<a href="${href({ vs: undefined })}" class="${route.vs ? '' : 'on'}">Results</a><span class="label">Swing vs</span>${options
-        .map((b) => `<a href="${href({ vs: b })}" class="${route.vs && baselineId(route.vs) === baselineId(b) ? 'on' : ''}" title="Shift since ${baselineLabel(b)}">${baselineLabel(b, true)}</a>`)
-        .join('')}`
-    : '';
+  const current = route.vs ? baselineId(route.vs) : '';
+  view.querySelector('select')!.innerHTML =
+    `<option value="${href({ vs: undefined })}">Results</option><optgroup label="Swing vs">${options
+      .map((b) => `<option value="${href({ vs: b })}"${baselineId(b) === current ? ' selected' : ''}>Swing vs ${baselineLabel(b)}</option>`)
+      .join('')}</optgroup>`;
 }
+
+$('#view').addEventListener('change', (e) => {
+  location.hash = (e.target as HTMLSelectElement).value;
+});
 
 function renderStatus() {
   const status = $('#status');

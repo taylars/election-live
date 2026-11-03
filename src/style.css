@@ -155,8 +155,13 @@ a.district:hover { border-color: var(--accent); }
 
 .mapbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-bottom: 6px; }
 .mapbar .crumbs { margin-bottom: 0; }
-.modes.view a { font-size: 13px; padding: 4px 10px; }
-.modes.view .label { font-size: 12px; color: var(--muted); padding: 0 2px 0 8px; align-self: center; white-space: nowrap; }
+.view { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.view[hidden] { display: none; }
+.view select {
+  font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 8px; cursor: pointer;
+}
+.view select:hover, .view select:focus { border-color: var(--accent); outline: none; }
 .swing { background: var(--card); border-radius: 10px; padding: 12px; font-size: 13px; margin-bottom: 4px; }
 .swing .big { font-size: 26px; font-weight: 800; line-height: 1.1; }
 .swing .rows { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; margin-top: 10px; }

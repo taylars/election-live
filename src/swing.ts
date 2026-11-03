@@ -11,10 +11,7 @@ export interface Baseline {
 
 export const baselineId = (b: Baseline) => `${b.race}-${b.year}`;
 
-export function baselineLabel(b: Baseline, short = false): string {
-  const race = short ? { president: 'Pres', senate: 'Sen', governor: 'Gov', house: 'House' }[b.race] : RACE_LABEL[b.race];
-  return `${b.year} ${race}`;
-}
+export const baselineLabel = (b: Baseline) => `${b.year} ${RACE_LABEL[b.race]}`;
 
 /**
  * What a race can be compared against: earlier presidential races (every county has
