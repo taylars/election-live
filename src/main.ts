@@ -160,7 +160,9 @@ async function load() {
       tasks.push(getForecast(race as Chamber));
     }
     // A district page lists the seat's results from every past year.
-    const pastYears = route.district ? ALL_YEARS.filter((y) => y !== LIVE_YEAR) : isLive() ? [] : [year];
+    // District pages list the seat's past results and state House pages the past delegations.
+    const allPast = race === 'house' && state;
+    const pastYears = allPast ? ALL_YEARS.filter((y) => y !== LIVE_YEAR) : isLive() ? [] : [year];
     for (const y of pastYears) {
       if (!pastData.has(y)) tasks.push(getPast(y).then((p) => pastData.set(y, p)));
     }
@@ -703,7 +705,7 @@ async function renderState() {
     }
     drawShapes(inState.map((d) => districtShape(d, regions, forecast, href({ district: d.id }))), outline);
     legend('', isLive());
-    panel.innerHTML = districtCards(regions, postal);
+    panel.innerHTML = stateHouseTally(regions, postal, forecast) + districtCards(regions, postal);
     return;
   }
 
@@ -963,9 +965,69 @@ function liveVoteBanks(byFips: Map<string, Region>): string {
 function districtCards(regions: Record<string, Region>, postal: string): string {
   const districts = districtsIn(regions, postal);
   if (!districts.length) return `<p class="muted">No House results for ${STATES[postal].name} in ${route.year}.</p>`;
-  return `<h2>${STATES[postal].name} House</h2><div class="districts">${districts
+  return `<h3>Districts</h3><div class="districts">${districts
     .map(([k, reg]) => `<a class="district" href="${href({ district: k })}"><div class="card-h"><b>${k.toUpperCase()}</b><span class="muted">${isLive() ? pct(reg.percent_reporting) : ''}</span></div>${candidateRows(reg.candidates, 3)}</a>`)
     .join('')}</div>`;
+}
+
+/** Seats won by each party among a set of districts. */
+function seatsWon(districts: [string, Region][]): Record<Side, number> {
+  const won: Record<Side, number> = { D: 0, R: 0, O: 0 };
+  for (const [, reg] of districts) {
+    const w = winnerOf(reg.candidates);
+    if (w) won[side(w.party)]++;
+  }
+  return won;
+}
+
+/**
+ * A state's House delegation: live, called seats plus the projection (as in the national
+ * tally); past years, seats won. Below it, the delegation in each other year.
+ */
+function stateHouseTally(regions: Record<string, Region>, postal: string, forecast: Record<string, Rating>): string {
+  const districts = districtsIn(regions, postal);
+  if (!districts.length) return `<h2>${STATES[postal].name} House</h2>`;
+  const total = districts.length;
+  let head: string;
+  if (isLive()) {
+    const t = tally(Object.fromEntries(districts), forecast, { D: 0, R: 0, O: 0 });
+    const tiers = (s: Side, order: ('secured' | 'likely' | 'lean')[]) =>
+      order.map((lvl) => ({ n: t[s][lvl], color: LEVEL_FILL[lvl](s), title: `${s} ${lvl}` }));
+    head = `
+      <div class="nums">
+        ${headline('D', `D ${t.D.secured}`, `Projected <b>${projected(t, 'D')}</b>`)}
+        ${projected(t, 'O') ? headline('O', `Oth ${t.O.secured}`, `Projected <b>${projected(t, 'O')}</b>`) : ''}
+        ${headline('R', `R ${t.R.secured}`, `Projected <b>${projected(t, 'R')}</b>`)}
+      </div>
+      ${seatBar([...tiers('D', ['secured', 'likely', 'lean']), ...tiers('O', ['secured', 'likely', 'lean']),
+        { n: t.tossup, color: TOSSUP, title: 'Toss-up' }, ...tiers('R', ['lean', 'likely', 'secured'])], total)}
+      <div class="muted">${total} seats · big numbers are called races${t.tossup ? ` · ${t.tossup} toss-up` : ''}</div>`;
+  } else {
+    const won = seatsWon(districts);
+    head = `
+      <div class="nums">${headline('D', `D ${won.D}`)}${won.O ? headline('O', `Oth ${won.O}`) : ''}${headline('R', `R ${won.R}`)}</div>
+      ${seatBar([
+        { n: won.D, color: PARTY.D, title: 'Democrat' },
+        { n: won.O, color: PARTY.O, title: 'Other' },
+        { n: total - won.D - won.R - won.O, color: '#3a4150', title: 'Not in data' },
+        { n: won.R, color: PARTY.R, title: 'Republican' },
+      ], total)}
+      <div class="muted">${total} seats won in ${route.year}</div>`;
+  }
+  const others = ALL_YEARS.filter((y) => y !== route.year && y !== LIVE_YEAR)
+    .map((y) => {
+      const past = districtsIn(pastData.get(y)?.house ?? {}, postal);
+      if (!past.length) return '';
+      const won = seatsWon(past);
+      return `<tr><td><a href="${href({ year: y })}">${y}</a></td>
+        <td style="color:${PARTY.D}">D ${won.D}</td><td style="color:${PARTY.R}">R ${won.R}</td>
+        <td class="muted">${past.length} seats</td></tr>`;
+    })
+    .join('');
+  return `
+    <h2>${STATES[postal].name} House</h2>
+    <div class="balance">${head}</div>
+    ${others ? `<h3>Delegation in other years</h3><table class="tbl">${others}</table>` : ''}`;
 }
 
 /**

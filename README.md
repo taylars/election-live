@@ -13,6 +13,7 @@ It's a static site (Vite + TypeScript + d3-geo) that runs on GitHub Pages. For 2
   - Past Senate/Governor: the chamber as seated the following January, plus seats won that year. Past House: seats won.
 - **State**: counties coloured by the race: live 2026 county results, or past presidential, Senate and Governor county results where available (otherwise the statewide result).
 - **County** (President, Senate, Governor): click a county on a state's map. Shows the selected race in that county (live 2026, or past presidential, Senate and Governor results) and the county's past presidential results.
+- **State House delegation**: a state's House page tallies its seats by party (live: called seats plus the projection; past: seats won) and lists the delegation in other years.
 - **District** (House): click a district on a state's map, or its card, for its result and the seat's results in 2020–2024.
 - URLs are shareable, e.g. `#/senate/2024/ga`, `#/house/2026/mi/07` or `#/senate/2026/ga/county/13121`.
 - Add `?testdata` to the URL (e.g. `/?testdata#/senate/2026`) to have civicAPI fill the races with simulated votes, for rehearsing before polls close.
