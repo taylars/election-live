@@ -55,9 +55,9 @@ export function pastMargin(p: PastResult): number {
   return (p.d - p.r) / p.t;
 }
 
-/** Past results: a narrow win is a light shade of the winner's colour, a landslide (40+) is solid. */
-function finalShade(color: string, margin: number): string {
-  return lighten(color, 0.7 * (1 - Math.min(1, Math.abs(margin) / 0.4)));
+/** Past results: a narrow win is a light shade of the winner's colour, a landslide (`full`, 40 points) is solid. */
+function finalShade(color: string, margin: number, full = 0.4): string {
+  return lighten(color, 0.7 * (1 - Math.min(1, Math.abs(margin) / full)));
 }
 
 /** Colour for a D-minus-R margin (positive = Democratic win) in a past result. */
@@ -104,8 +104,11 @@ export function fmtMargin(m: number): string {
   return `${m >= 0 ? 'D' : 'R'}+${(Math.abs(m) * 100).toFixed(1)}`;
 }
 
-/** Swing map colour: the party the place moved toward, deeper the bigger the shift (full at 15 points). */
+/**
+ * Swing map colour, in the same shades as past margins: light for a small shift toward
+ * a party, solid at 15 points (swings are much smaller than margins).
+ */
 export function swingFill(s: number): string {
-  if (Math.abs(s) < 0.0005) return lighten(BASE, 0.25);
-  return tint(s > 0 ? PARTY.D : PARTY.R, 0.2 + 0.8 * Math.min(1, Math.abs(s) / 0.15));
+  if (Math.abs(s) < 0.0005) return lighten(BASE, 0.7);
+  return finalShade(s > 0 ? PARTY.D : PARTY.R, s, 0.15);
 }
