@@ -7,6 +7,7 @@ It's a static site (Vite + TypeScript + d3-geo) that runs on GitHub Pages. Visit
 ## Views
 
 - **National**: states (or, for the House, all 435 districts) coloured by leader (solid = called). Before any votes are in, states are shaded by civicAPI's forecast rating. Includes a balance-of-power bar and race cards sorted closest-first.
+- **Seat tally**: secured seats (called races plus seats not up this year), and a projection that adds each uncalled race as *likely* or *lean* for a party, or *toss-up*. Before a race reaches 15% reporting, its tier comes from civicAPI's forecast rating (Safe/Likely → likely, Lean/Tilt → lean). After that it comes from the live margin divided by the square root of the share still out, so races firm up or loosen through the night (see `src/projection.ts`). Race cards show each race's current tier; a • marks tiers based on live results.
 - **State**: click a state to see its counties, the race details, past statewide results, and the biggest counties ("where the votes are").
 - **Modes**: `2026 live`, `2024 pres.` / `2020 pres.` (past maps), and in a state, `Shift vs 2024` (how far each county has moved since 2024).
 - URLs are shareable, e.g. `#/senate/ga?mode=shift`.

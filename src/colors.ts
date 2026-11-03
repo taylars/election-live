@@ -1,4 +1,4 @@
-import type { Candidate, PastResult } from './api';
+import type { Candidate, PastResult, Side } from './api';
 import { side } from './api';
 
 export const PARTY = { D: '#2f6fe0', R: '#e0393e', O: '#a173e0' };
@@ -63,6 +63,15 @@ export function shiftFill(delta: number): string {
   return tint(delta >= 0 ? PARTY.D : PARTY.R, 0.15 + 0.85 * Math.min(1, Math.abs(delta) / 0.15));
 }
 
+export const TOSSUP = '#5b5540';
+
+/** Seat-bar colours for each projection tier: solid when secured, paler as it gets less certain. */
+export const LEVEL_FILL: Record<'secured' | 'likely' | 'lean', (s: Side) => string> = {
+  secured: (s) => PARTY[s],
+  likely: (s) => tint(PARTY[s], 0.6),
+  lean: (s) => tint(PARTY[s], 0.35),
+};
+
 const RATING_STRENGTH: Record<string, number> = { Safe: 0.55, Likely: 0.42, Lean: 0.3, Tilt: 0.2 };
 
 /** Pre-results colouring from a forecast rating like "Lean R" or "Toss-up". */
@@ -70,7 +79,7 @@ export function ratingFill(rating: string | undefined): string | null {
   if (!rating) return null;
   const [level, who] = rating.split(' ');
   const strength = RATING_STRENGTH[level];
-  if (!strength || (who !== 'D' && who !== 'R')) return '#5b5540';
+  if (!strength || (who !== 'D' && who !== 'R')) return TOSSUP;
   return tint(PARTY[who], strength);
 }
 

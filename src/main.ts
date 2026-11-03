@@ -2,13 +2,14 @@ import './style.css';
 import { geoPath } from 'd3-geo';
 import {
   CHAMBER, NATIONAL_RACE, TEST_DATA, getForecast, getHistory, getRace, side,
-  type Candidate, type Chamber, type History, type Race, type Rating, type Region,
+  type Candidate, type Chamber, type History, type Race, type Rating, type Region, type Side,
 } from './api';
 import {
-  NO_DATA, NO_RACE, PARTY, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
+  LEVEL_FILL, NO_DATA, NO_RACE, PARTY, TOSSUP, fmtMargin, liveFill, liveMargin, marginFill, partyColor,
   pastMargin, ranked, ratingFill, shiftFill,
 } from './colors';
 import { POSTAL_BY_FIPS, STATES, countyKey, loadAtlas, loadDistricts, type Atlas, type District, type Shape } from './geo';
+import { MIN_REPORTING, projectRace, projected, projectionLabel, tally } from './projection';
 
 const REFRESH_MS = 30_000;
 const W = 975;
@@ -337,7 +338,7 @@ async function renderNation(history: History) {
       `<path class="borders" d="${path(atlas.stateBorders)}"/><path class="borders" d="${path(atlas.nation as never)}"/>`,
     );
     legend('live', 'Lighter shades before votes: forecast rating');
-    $('#panel').innerHTML = race ? balance(race) + houseList(race) : `<p class="muted">Loading results…</p>`;
+    $('#panel').innerHTML = race ? balance(race, forecast) + houseList(race) : `<p class="muted">Loading results…</p>`;
     return;
   }
   let usedForecast = false;
@@ -374,35 +375,61 @@ async function renderNation(history: History) {
     panel.innerHTML = `<p class="muted">Loading results…</p>`;
     return;
   }
-  if (past) {
-    panel.innerHTML = balance(race) + pastSummary(past, mode);
-  } else {
-    panel.innerHTML = balance(race) + raceList(race, forecast);
-  }
+  panel.innerHTML = balance(race, forecast) + (past ? pastSummary(past, mode) : raceList(race, forecast));
 }
 
-function balance(race: Race): string {
-  const info = CHAMBER[route.chamber];
-  // Senate/governor roll-ups carry seat counts (holdovers + calls); the House one
-  // doesn't, so count called districts instead.
+/** Seats not up this year, by party, from the roll-up race's seat counts. */
+function holdovers(race: Race): Record<Side, number> {
   const regions = Object.values(race.region_results ?? {});
-  const seats = (s: 'D' | 'R' | 'O') =>
-    route.chamber === 'house'
-      ? regions.filter((r) => r.candidates.some((c) => c.winner && side(c.party) === s)).length
-      : race.candidates.filter((c) => side(c.party) === s).reduce((n, c) => n + (c.seats ?? 0), 0);
-  const d = seats('D'), r = seats('R'), o = seats('O');
-  const open = Math.max(0, info.total - d - r - o);
+  const seats = (s: Side) => race.candidates.filter((c) => side(c.party) === s).reduce((n, c) => n + (c.seats ?? 0), 0);
+  const called = (s: Side) => regions.filter((r) => r.candidates.some((c) => c.winner && side(c.party) === s)).length;
+  // civicAPI's seat counts are holdovers only (they sum to total minus races up).
+  // If they ever start including calls too, take those back out so calls aren't counted twice.
+  const sum = seats('D') + seats('R') + seats('O');
+  const includesCalls = sum + regions.length > CHAMBER[route.chamber].total;
+  const h = (s: Side) => Math.max(0, seats(s) - (includesCalls ? called(s) : 0));
+  return { D: h('D'), R: h('R'), O: h('O') };
+}
+
+function balance(race: Race, forecast: Record<string, Rating>): string {
+  const info = CHAMBER[route.chamber];
+  const t = tally(race.region_results ?? {}, forecast, holdovers(race));
   const w = (n: number) => `${(n / info.total) * 100}%`;
+  const seg = (n: number, color: string, title: string) =>
+    n ? `<span style="width:${w(n)};background:${color}" title="${title}: ${n}"></span>` : '';
+  const sideBar = (s: Side, order: ('secured' | 'likely' | 'lean')[]) =>
+    order.map((lvl) => seg(t[s][lvl], LEVEL_FILL[lvl](s), `${s} ${lvl}`)).join('');
+  const secured = (s: Side) => t[s].secured;
+  const proj = (s: Side) => projected(t, s);
+  const status = (s: Side) =>
+    info.majority && secured(s) >= info.majority ? 'wins control' : info.majority && proj(s) >= info.majority ? 'projected control' : '';
+  const sideNums = (s: Side) => `
+    <div class="side ${s}">
+      <b style="color:${PARTY[s]}">${s === 'O' ? 'Oth' : s} ${secured(s)}</b>
+      <span>Projected <b>${proj(s)}</b></span>
+      ${status(s) ? `<em>${status(s)}</em>` : ''}
+    </div>`;
+  const breakdown = (s: Side) =>
+    `<span style="color:${PARTY[s]}">${s}</span> ${t[s].secured} secured · ${t[s].likely} likely · ${t[s].lean} lean`;
   return `
     <div class="balance">
-      <div class="nums"><b style="color:${PARTY.D}">D ${d}</b>${o ? `<b style="color:${PARTY.O}">Oth ${o}</b>` : ''}<b style="color:${PARTY.R}">R ${r}</b></div>
+      <div class="nums">${sideNums('D')}${t.O.secured + t.O.likely + t.O.lean ? sideNums('O') : ''}${sideNums('R')}</div>
       <div class="seatbar">
-        <span style="width:${w(d)};background:${PARTY.D}"></span><span style="width:${w(o)};background:${PARTY.O}"></span>
-        <span style="width:${w(open)}" class="open"></span><span style="width:${w(r)};background:${PARTY.R}"></span>
+        ${sideBar('D', ['secured', 'likely', 'lean'])}${sideBar('O', ['secured', 'likely', 'lean'])}
+        ${seg(t.tossup, TOSSUP, 'Toss-up')}
+        ${sideBar('R', ['lean', 'likely', 'secured'])}
         ${info.majority ? `<i class="maj" style="left:${w(info.majority)}"></i>` : ''}
       </div>
-      <div class="muted">${open} ${info.unit} undecided${info.majority ? ` · ${info.majority} for control` : ''}${route.chamber === 'house' ? '' : ' · includes seats not up this year'}</div>
+      <div class="breakdown">${breakdown('D')}<br>${breakdown('R')}<br>${t.tossup} toss-up${info.majority ? ` · ${info.majority} for control` : ''}</div>
+      <div class="muted">Big numbers are secured seats: called races${route.chamber === 'house' ? '' : ' and seats not up this year'}.
+        Projections use forecast ratings until ${MIN_REPORTING}% of a race reports, then live margins and the vote still out.</div>
     </div>`;
+}
+
+function projectionChip(p: ReturnType<typeof projectRace>): string {
+  const color = p.side && p.level !== 'tossup' ? PARTY[p.side] : 'var(--muted)';
+  const title = p.source === 'live' ? 'From live results' : 'From the pre-election forecast';
+  return `<span class="chip" style="color:${color}" title="${title}">${projectionLabel(p)}${p.source === 'live' ? ' •' : ''}</span>`;
 }
 
 function raceList(race: Race, forecast: Record<string, Rating>): string {
@@ -414,7 +441,8 @@ function raceList(race: Race, forecast: Record<string, Rating>): string {
     const winner = reg.candidates.find((c) => c.winner);
     const inc = forecast[postal]?.incumbent_party;
     const flip = winner && inc && side(winner.party) !== inc && side(winner.party) !== 'O';
-    return { postal, reg, top, total, margin, winner, flip, rating: forecast[postal]?.rating };
+    const projection = projectRace(reg.candidates, reg.percent_reporting, forecast[postal]?.rating);
+    return { postal, reg, top, total, margin, winner, flip, projection };
   });
   // Races with votes and no call first, closest first; then the rest alphabetically.
   rows.sort((a, b) => {
@@ -427,7 +455,7 @@ function raceList(race: Race, forecast: Record<string, Rating>): string {
       (r) => `
       <a class="card" href="${href({ state: r.postal })}">
         <div class="card-h"><b>${esc(STATES[r.postal]?.name ?? r.reg.name)}</b>
-          ${r.flip ? '<span class="chip flip">FLIP</span>' : ''}${r.rating && !r.total ? `<span class="chip">${esc(r.rating)}</span>` : ''}
+          ${r.flip ? '<span class="chip flip">FLIP</span>' : ''}${!r.winner && r.projection.source !== 'none' ? projectionChip(r.projection) : ''}
           <span class="muted">${pct(r.reg.percent_reporting)}</span></div>
         ${r.top
           .slice(0, 2)
